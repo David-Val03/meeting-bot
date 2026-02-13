@@ -20,26 +20,34 @@ const joinGoogleMeet = async (req: Request, res: Response) => {
     timezone,
     userId,
     eventId,
-    botId
+    botId,
+    audioOnly,
   }: MeetingJoinParams = req.body;
 
   // Validate required fields
   if (!bearerToken || !url || !name || !teamId || !timezone || !userId) {
     return res.status(400).json({
       success: false,
-      error: 'Missing required fields: bearerToken, url, name, teamId, timezone, userId'
+      error:
+        'Missing required fields: bearerToken, url, name, teamId, timezone, userId',
     });
   }
 
   if (!botId && !eventId) {
     return res.status(400).json({
       success: false,
-      error: 'Missing required fields: botId or eventId'
+      error: 'Missing required fields: botId or eventId',
     });
   }
 
   // Create correlation ID and logger
-  const correlationId = createCorrelationId({ teamId, userId, botId, eventId, url });
+  const correlationId = createCorrelationId({
+    teamId,
+    userId,
+    botId,
+    eventId,
+    url,
+  });
   const logger = loggerFactory(correlationId, 'google');
 
   try {
@@ -65,19 +73,34 @@ const joinGoogleMeet = async (req: Request, res: Response) => {
 
       // Create and join the meeting
       const bot = new GoogleMeetBot(logger, correlationId);
-      await bot.join({ url, name, bearerToken, teamId, timezone, userId, eventId, botId, uploader });
+      await bot.join({
+        url,
+        name,
+        bearerToken,
+        teamId,
+        timezone,
+        userId,
+        eventId,
+        botId,
+        uploader,
+        audioOnly,
+      });
     }, logger);
 
     if (!jobResult.accepted) {
       return res.status(409).json({
         success: false,
-        error: 'Another meeting is currently being processed. Please try again later.',
-        data: { userId, teamId, eventId, botId }
+        error:
+          'Another meeting is currently being processed. Please try again later.',
+        data: { userId, teamId, eventId, botId },
       });
     }
 
     // Job was accepted, return immediate response
-    logger.info('Google Meet job accepted and started processing', { userId, teamId });
+    logger.info('Google Meet job accepted and started processing', {
+      userId,
+      teamId,
+    });
 
     return res.status(202).json({
       success: true,
@@ -87,12 +110,17 @@ const joinGoogleMeet = async (req: Request, res: Response) => {
         teamId,
         eventId,
         botId,
-        status: 'processing'
-      }
+        status: 'processing',
+      },
     });
-
   } catch (error) {
-    logger.error('Error setting up Google Meet job:', { userId, teamId, botId, eventId, error });
+    logger.error('Error setting up Google Meet job:', {
+      userId,
+      teamId,
+      botId,
+      eventId,
+      error,
+    });
 
     if (error instanceof AxiosError) {
       logger.error('axios error', {
@@ -100,17 +128,18 @@ const joinGoogleMeet = async (req: Request, res: Response) => {
         teamId,
         botId,
         data: error?.response?.data,
-        config: error?.response?.config
+        config: error?.response?.config,
       });
     }
 
     // Return appropriate error response
-    const statusCode = error instanceof AxiosError ? (error.response?.status || 500) : 500;
+    const statusCode =
+      error instanceof AxiosError ? error.response?.status || 500 : 500;
 
     return res.status(statusCode).json({
       success: false,
       error: error instanceof Error ? error.message : 'Unknown error occurred',
-      data: { userId, teamId, eventId, botId }
+      data: { userId, teamId, eventId, botId },
     });
   }
 };

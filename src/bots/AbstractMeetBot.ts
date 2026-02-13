@@ -10,6 +10,7 @@ export interface BotLaunchParams {
   timezone: string;
   botId?: string;
   eventId?: string;
+  audioOnly?: boolean;
 }
 
 export interface JoinParams {
@@ -22,6 +23,7 @@ export interface JoinParams {
   botId?: string;
   eventId?: string;
   uploader: IUploader;
+  audioOnly?: boolean;
 }
 
 export abstract class AbstractMeetBot {
