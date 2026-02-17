@@ -11,7 +11,12 @@ chromium.use(stealthPlugin);
 
 export type BotType = 'microsoft' | 'google' | 'zoom';
 
-function attachBrowserErrorHandlers(browser: Browser, context: BrowserContext, page: Page, correlationId: string) {
+function attachBrowserErrorHandlers(
+  browser: Browser,
+  context: BrowserContext,
+  page: Page,
+  correlationId: string,
+) {
   const log = getCorrelationIdLog(correlationId);
 
   browser.on('disconnected', () => {
@@ -31,7 +36,11 @@ function attachBrowserErrorHandlers(browser: Browser, context: BrowserContext, p
   });
 }
 
-async function launchBrowserWithTimeout(launchFn: () => Promise<Browser>, timeoutMs: number, correlationId: string): Promise<Browser> {
+async function launchBrowserWithTimeout(
+  launchFn: () => Promise<Browser>,
+  timeoutMs: number,
+  correlationId: string,
+): Promise<Browser> {
   let timeoutId: NodeJS.Timeout;
   let finished = false;
 
@@ -46,16 +55,21 @@ async function launchBrowserWithTimeout(launchFn: () => Promise<Browser>, timeou
 
     // Start launch
     launchFn()
-      .then(result => {
+      .then((result) => {
         if (!finished) {
           finished = true;
           clearTimeout(timeoutId);
-          console.log(`${getCorrelationIdLog(correlationId)} Browser launch function success!`);
+          console.log(
+            `${getCorrelationIdLog(correlationId)} Browser launch function success!`,
+          );
           resolve(result);
         }
       })
-      .catch(err => {
-        console.error(`${getCorrelationIdLog(correlationId)} Error launching browser`, err);
+      .catch((err) => {
+        console.error(
+          `${getCorrelationIdLog(correlationId)} Error launching browser`,
+          err,
+        );
         if (!finished) {
           finished = true;
           clearTimeout(timeoutId);
@@ -65,7 +79,11 @@ async function launchBrowserWithTimeout(launchFn: () => Promise<Browser>, timeou
   });
 }
 
-async function createBrowserContext(url: string, correlationId: string, botType: BotType = 'google'): Promise<Page> {
+async function createBrowserContext(
+  url: string,
+  correlationId: string,
+  botType: BotType = 'google',
+): Promise<Page> {
   const size = { width: 1280, height: 720 };
 
   // Base browser args used by all bots
@@ -75,8 +93,8 @@ async function createBrowserContext(url: string, correlationId: string, botType:
     '--no-sandbox',
     '--disable-setuid-sandbox',
     '--disable-web-security',
-    '--use-gl=angle',
-    '--use-angle=swiftshader',
+    // '--use-gl=angle',
+    // '--use-angle=swiftshader',
     `--window-size=${size.width},${size.height}`,
     '--auto-accept-this-tab-capture',
     '--enable-features=MediaRecorder',
@@ -96,34 +114,35 @@ async function createBrowserContext(url: string, correlationId: string, botType:
   // and don't need fake devices:
   // - Google Meet: clicks "Continue without microphone and camera"
   // - Zoom: expects "Cannot detect your camera/microphone" notifications
-  const browserArgs = botType === 'microsoft'
-    ? [...baseBrowserArgs, ...fakeDeviceArgs]
-    : baseBrowserArgs;
+  const browserArgs =
+    botType === 'microsoft'
+      ? [...baseBrowserArgs, ...fakeDeviceArgs]
+      : baseBrowserArgs;
 
   // Teams-specific display args: kiosk mode prevents address bar from showing in ffmpeg recording
   // Google Meet and Zoom don't need this since they use tab capture (getDisplayMedia)
-  const displayArgs = botType === 'microsoft'
-    ? ['--kiosk', '--start-maximized']
-    : [];
+  const displayArgs =
+    botType === 'microsoft' ? ['--kiosk', '--start-maximized'] : [];
 
-  console.log(`${getCorrelationIdLog(correlationId)} Launching browser for ${botType} bot (fake devices: ${botType === 'microsoft'})`);
-
-  const browser = await launchBrowserWithTimeout(
-    async () => await chromium.launch({
-      headless: false,
-      args: [
-        ...browserArgs,
-        ...displayArgs,
-      ],
-      ignoreDefaultArgs: ['--mute-audio'],
-      executablePath: config.chromeExecutablePath,
-    }),
-    60000,
-    correlationId
+  console.log(
+    `${getCorrelationIdLog(correlationId)} Launching browser for ${botType} bot (fake devices: ${botType === 'microsoft'})`,
   );
 
-  const linuxX11UserAgent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36';
-  
+  const browser = await launchBrowserWithTimeout(
+    async () =>
+      await chromium.launch({
+        headless: false,
+        args: [...browserArgs, ...displayArgs],
+        ignoreDefaultArgs: ['--mute-audio'],
+        executablePath: config.chromeExecutablePath,
+      }),
+    60000,
+    correlationId,
+  );
+
+  const linuxX11UserAgent =
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36';
+
   const context = await browser.newContext({
     permissions: ['camera', 'microphone'],
     viewport: size,
@@ -146,7 +165,9 @@ async function createBrowserContext(url: string, correlationId: string, botType:
   // Attach common error handlers
   attachBrowserErrorHandlers(browser, context, page, correlationId);
 
-  console.log(`${getCorrelationIdLog(correlationId)} Browser launched successfully!`);
+  console.log(
+    `${getCorrelationIdLog(correlationId)} Browser launched successfully!`,
+  );
 
   return page;
 }

@@ -92,6 +92,10 @@ export class GoogleMeetBot extends MeetBotBase {
         this._logger,
       );
     } catch (error) {
+      this._logger.error('Error in GoogleMeetBot.join:', {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
       if (!_state.includes('finished')) _state.push('failed');
 
       await patchBotStatus(
@@ -469,7 +473,7 @@ export class GoogleMeetBot extends MeetBotBase {
                           // If we have Leave call button AND no lobby mode text, we're likely in the call
                           const hasLobbyText =
                             bodyText.includes('Asking to join') ||
-                            bodyText.includes('You\'re the only one here');
+                            bodyText.includes("You're the only one here");
                           if (!hasLobbyText) {
                             return true;
                           }
@@ -1376,7 +1380,7 @@ export class GoogleMeetBot extends MeetBotBase {
                 const currentBodyText = document.body.innerText;
                 if (
                   currentBodyText.includes(
-                    'You\'ve been removed from the meeting',
+                    "You've been removed from the meeting",
                   )
                 ) {
                   console.warn(
