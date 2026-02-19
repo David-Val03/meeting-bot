@@ -13,6 +13,20 @@
   },
   "keywords": [],
   "author": "screenappai",
+  "nodemonConfig": {
+    "ignore": [
+      "dist",
+      "debug-videos",
+      "test-results",
+      "playwright-report",
+      "*.log"
+    ],
+    "watch": [
+      "src"
+    ],
+    "ext": "ts",
+    "legacyWatch": true
+  },
   "devDependencies": {
     "@playwright/test": "^1.45.3",
     "@types/express": "^4.17.21",

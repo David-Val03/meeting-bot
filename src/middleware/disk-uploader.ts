@@ -1,25 +1,42 @@
-import { Logger } from 'winston';
 import {
   createPartUploadUrl,
   fileNameTemplate,
   finalizeUpload,
   initializeMultipartUpload,
-  uploadChunkToStorage
+  uploadChunkToStorage,
 } from '../services/uploadService';
-import { ContentType, extensionToContentType, FileType } from '../types';
+import {
+  ContentType,
+  extensionToContentType,
+  FileType,
+  TranscriptRawEntry,
+} from '../types';
 import fs, { createWriteStream } from 'fs';
 import path from 'path';
+import { tmpdir } from 'os';
 import { LogAggregator } from '../util/logger';
-import config from '../config';
+import { Logger } from 'winston';
+import config, { NODE_ENV } from '../config';
 import { getStorageProvider } from '../uploader/providers/factory';
 import { getTimeString } from '../lib/datetime';
-import { notifyRecordingCompleted, RecordingCompletedPayload } from '../services/notificationService';
+import {
+  notifyRecordingCompleted,
+  RecordingCompletedPayload,
+} from '../services/notificationService';
 
 console.log(' ----- PWD OR CWD ----- ', process.cwd());
 
-const tempFolder = path.join(process.cwd(), 'dist', '_tempvideo');
+const tempFolder =
+  NODE_ENV === 'development'
+    ? path.join(tmpdir(), 'meeting-bot', '_tempvideo')
+    : path.join(process.cwd(), 'dist', '_tempvideo');
 
-function isNoSuchUploadError(err: any, userId: string, logger: Logger): boolean {
+function isNoSuchUploadError(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  err: any, // Keeping 'any' to handle diverse error structures from different providers safely
+  userId: string,
+  logger: Logger,
+): boolean {
   /**
    * Error includes:
    * code: ERR_BAD_REQUEST
@@ -31,20 +48,28 @@ function isNoSuchUploadError(err: any, userId: string, logger: Logger): boolean 
    */
   const xml = err?.response?.data || err?.data || '';
 
-  const isNoSuchUpload = typeof xml === 'string' && xml?.includes('NoSuchUpload');
+  const isNoSuchUpload =
+    typeof xml === 'string' && xml?.includes('NoSuchUpload');
 
   if (isNoSuchUpload) {
     const code = err?.code;
     const status = err?.response?.status;
-    logger.error('Critical: NoSuchUpload error on user', { userId, status, code });
+    logger.error('Critical: NoSuchUpload error on user', {
+      userId,
+      status,
+      code,
+    });
   }
 
   return isNoSuchUpload;
 }
 
 export interface IUploader {
-  uploadRecordingToRemoteStorage(options?: { forceUpload?: boolean }): Promise<boolean>;
+  uploadRecordingToRemoteStorage(options?: {
+    forceUpload?: boolean;
+  }): Promise<boolean>;
   saveDataToTempFile(data: Buffer): Promise<boolean>;
+  saveTranscript(data: TranscriptRawEntry): Promise<boolean>;
 }
 
 // Save to disk and upload in one session
@@ -55,6 +80,7 @@ class DiskUploader implements IUploader {
   private _timezone: string;
   private _userId: string;
   private _botId: string;
+  private _eventId?: string;
   private _namePrefix: string;
   private _tempFileId: string;
   private _logger: Logger;
@@ -68,13 +94,14 @@ class DiskUploader implements IUploader {
   private readonly MAX_GLOBAL_FAILURES = 5;
 
   private folderId = 'private'; // Assume meetings belong to an individual
-  private contentType: ContentType = extensionToContentType[config.uploaderFileExtension] ?? 'video/webm'; // Default video format
+  private contentType: ContentType =
+    extensionToContentType[config.uploaderFileExtension] ?? 'video/webm'; // Default video format
   private fileExtension: string = config.uploaderFileExtension;
   private fileId: string;
   private uploadId: string;
   private lastUploadedBlobUrl?: string;
   private lastRecordingId?: string;
-  private lastStorageDetails?: Record<string, any>;
+  private lastStorageDetails?: Record<string, unknown>;
 
   private queue: Buffer[];
   private writing: boolean;
@@ -91,13 +118,15 @@ class DiskUploader implements IUploader {
     namePrefix: string,
     tempFileId: string,
     logger: Logger,
-    meetingLink?: string
+    meetingLink?: string,
+    eventId?: string,
   ) {
     this._token = token;
     this._teamId = teamId;
     this._timezone = timezone;
     this._userId = userId;
     this._botId = botId;
+    this._eventId = eventId;
     this._namePrefix = namePrefix;
     this._tempFileId = tempFileId;
     this._logger = logger;
@@ -105,7 +134,10 @@ class DiskUploader implements IUploader {
 
     this.queue = [];
     this.writing = false;
-    this.diskWriteSuccess = new LogAggregator(this._logger, `Success writing temp chunk to disk ${this._userId}`);
+    this.diskWriteSuccess = new LogAggregator(
+      this._logger,
+      `Success writing temp chunk to disk ${this._userId}`,
+    );
     this.forceUpload = false;
   }
 
@@ -118,7 +150,8 @@ class DiskUploader implements IUploader {
     namePrefix: string,
     tempFileId: string,
     logger: Logger,
-    meetingLink?: string
+    meetingLink?: string,
+    eventId?: string,
   ) {
     const folderPath = DiskUploader.getFolderPath(userId);
 
@@ -133,15 +166,23 @@ class DiskUploader implements IUploader {
       namePrefix,
       tempFileId,
       logger,
-      meetingLink
+      meetingLink,
+      eventId,
     );
     return instance;
   }
 
   private async uploadChunk(data: Buffer, partNumber: number) {
-    this._logger.info('Uploader sending part...', partNumber, this._userId, this._teamId);
+    this._logger.info(
+      'Uploader sending part...',
+      partNumber,
+      this._userId,
+      this._teamId,
+    );
 
-    const blob = new Blob([new Uint8Array(data as Buffer)], { type: 'application/octet-stream' });
+    const blob = new Blob([new Uint8Array(data as Buffer)], {
+      type: 'application/octet-stream',
+    });
 
     // Upload chunks to the server
     const uploadUrl = await createPartUploadUrl({
@@ -154,12 +195,20 @@ class DiskUploader implements IUploader {
       token: this._token,
     });
 
-    await uploadChunkToStorage({
-      uploadUrl,
-      chunk: blob,
-    }, this._logger);
+    await uploadChunkToStorage(
+      {
+        uploadUrl,
+        chunk: blob,
+      },
+      this._logger,
+    );
 
-    this._logger.info('Uploader completed part...', partNumber, this._userId, this._teamId);
+    this._logger.info(
+      'Uploader completed part...',
+      partNumber,
+      this._userId,
+      this._teamId,
+    );
   }
 
   private async connect() {
@@ -179,37 +228,57 @@ class DiskUploader implements IUploader {
   }
 
   private async finish() {
-    this._logger.info('Client finishing upload ...', this._userId, this._teamId);
+    this._logger.info(
+      'Client finishing upload ...',
+      this._userId,
+      this._teamId,
+    );
 
     // Finalise upload
-    const file: FileType = await finalizeUpload({
-      teamId: this._teamId,
-      folderId: this.folderId,
-      fileId: this.fileId,
-      uploadId: this.uploadId,
-      contentType: this.contentType,
-      token: this._token,
-      timezone: this._timezone,
-      namePrefix: this._namePrefix,
-      botId: this._botId,
-    }, this._logger);
-    this._logger.info('Finish recording upload...', file.name, this._userId, this._teamId);
+    const file: FileType = await finalizeUpload(
+      {
+        teamId: this._teamId,
+        folderId: this.folderId,
+        fileId: this.fileId,
+        uploadId: this.uploadId,
+        contentType: this.contentType,
+        token: this._token,
+        timezone: this._timezone,
+        namePrefix: this._namePrefix,
+        botId: this._botId,
+      },
+      this._logger,
+    );
+    this._logger.info(
+      'Finish recording upload...',
+      file.name,
+      this._userId,
+      this._teamId,
+    );
     try {
       // Capture URL/recordingId if available
-      const fileUrl = file.url || (file.defaultProfile && file.alternativeFormats?.[file.defaultProfile]?.url) || undefined;
+      const fileUrl =
+        file.url ||
+        (file.defaultProfile &&
+          file.alternativeFormats?.[file.defaultProfile]?.url) ||
+        undefined;
       this.lastUploadedBlobUrl = fileUrl;
       if (file.recordingId) this.lastRecordingId = file.recordingId;
     } catch {}
     try {
       // Capture URL/recordingId if available
-      const fileUrl = file.url || (file.defaultProfile && file.alternativeFormats?.[file.defaultProfile]?.url) || undefined;
+      const fileUrl =
+        file.url ||
+        (file.defaultProfile &&
+          file.alternativeFormats?.[file.defaultProfile]?.url) ||
+        undefined;
       this.lastUploadedBlobUrl = fileUrl;
       if (file.recordingId) this.lastRecordingId = file.recordingId;
       // Capture storage details for screenapp/vfs flow
       try {
         this.lastStorageDetails = {
           provider: 'screenapp',
-          fileId: (file as any)?._id,
+          fileId: (file as unknown as { _id: string })._id,
           url: fileUrl,
           defaultProfile: file.defaultProfile,
         };
@@ -218,7 +287,11 @@ class DiskUploader implements IUploader {
   }
 
   private writeChunkToDisk(chunk: Buffer): Promise<void> {
-    const filePath = DiskUploader.getFilePath(this._userId, this._tempFileId, this.fileExtension);
+    const filePath = DiskUploader.getFilePath(
+      this._userId,
+      this._tempFileId,
+      this.fileExtension,
+    );
 
     return new Promise((resolve, reject) => {
       const stream = createWriteStream(filePath, {
@@ -264,15 +337,29 @@ class DiskUploader implements IUploader {
               this.queue.unshift(chunk); // put chunk back at front
 
               if (this.consecutiveWriteFailures >= this.MAX_GLOBAL_FAILURES) {
-                this._logger.error(`Abandoning write after ${this.consecutiveWriteFailures} global failures`, this._userId, err);
+                this._logger.error(
+                  `Abandoning write after ${this.consecutiveWriteFailures} global failures`,
+                  this._userId,
+                  err,
+                );
                 this.writing = false;
                 return; // give up entirely
               }
-              this._logger.info('Temporarily exit disk writing on error', this._userId, err);
+              this._logger.info(
+                'Temporarily exit disk writing on error',
+                this._userId,
+                err,
+              );
               break; // exit inner retry loop, but keep outer loop running
             }
-            this._logger.error(`Attempt to re-write chunk at attempt ${attempt}:`, this._userId, err);
-            await new Promise((resolve) => setTimeout(resolve, delayMs * attempt));
+            this._logger.error(
+              `Attempt to re-write chunk at attempt ${attempt}:`,
+              this._userId,
+              err,
+            );
+            await new Promise((resolve) =>
+              setTimeout(resolve, delayMs * attempt),
+            );
           }
         }
       }
@@ -291,7 +378,10 @@ class DiskUploader implements IUploader {
           this.diskWriteSuccess.log();
         })
         .catch((err) => {
-          this._logger.info('Failure during queue processing to write to disk', this._userId);
+          this._logger.info(
+            'Failure during queue processing to write to disk',
+            this._userId,
+          );
           throw err;
         });
     }
@@ -301,13 +391,22 @@ class DiskUploader implements IUploader {
     try {
       if (this.forceUpload) {
         // Stop disk writes when the upload or data recovery has started!
-        this._logger.info('Force upload is enabled. Stopping disk writes...', this._userId, this._teamId);
+        this._logger.info(
+          'Force upload is enabled. Stopping disk writes...',
+          this._userId,
+          this._teamId,
+        );
         return false;
       }
       this.enqueue(data);
       return true;
-    } catch(err) {
-      this._logger.info('Error: Unable to save the chunk to disk...', this._userId, this._teamId, err);
+    } catch (err) {
+      this._logger.info(
+        'Error: Unable to save the chunk to disk...',
+        this._userId,
+        this._teamId,
+        err,
+      );
       return false;
     }
   }
@@ -317,15 +416,48 @@ class DiskUploader implements IUploader {
     return folderPath;
   }
 
-  private static getFilePath(userId: string, tempFileId: string, fileExtension: string) {
+  private static getFilePath(
+    userId: string,
+    tempFileId: string,
+    fileExtension: string,
+  ) {
     const fileName = `${tempFileId}${fileExtension}`;
     const folderPath = DiskUploader.getFolderPath(userId);
     const filePath = path.join(folderPath, fileName);
     return filePath;
   }
 
+  private static getTranscriptFilePath(userId: string, tempFileId: string) {
+    const fileName = `${tempFileId}.json`;
+    const folderPath = DiskUploader.getFolderPath(userId);
+    const filePath = path.join(folderPath, fileName);
+    return filePath;
+  }
+
+  public async saveTranscript(data: TranscriptRawEntry): Promise<boolean> {
+    try {
+      if (this.forceUpload) return false;
+
+      const filePath = DiskUploader.getTranscriptFilePath(
+        this._userId,
+        this._tempFileId,
+      );
+      const line = JSON.stringify(data) + '\n';
+
+      await fs.promises.appendFile(filePath, line, 'utf8');
+      return true;
+    } catch (err) {
+      this._logger.warn('Failed to save transcript line', this._userId, err);
+      return false;
+    }
+  }
+
   private async processRecordingUpload() {
-    const filePath = DiskUploader.getFilePath(this._userId, this._tempFileId, this.fileExtension);
+    const filePath = DiskUploader.getFilePath(
+      this._userId,
+      this._tempFileId,
+      this.fileExtension,
+    );
     const chunkSize = this.UPLOAD_CHUNK_SIZE;
 
     await this.connect();
@@ -341,16 +473,23 @@ class DiskUploader implements IUploader {
       const buffer = Buffer.alloc(currentChunkSize);
 
       const fd = await fs.promises.open(filePath, 'r');
-      await fd.read(buffer, 0, currentChunkSize, offset);
+      await fd.read(
+        buffer as unknown as Uint8Array,
+        0,
+        currentChunkSize,
+        offset,
+      );
       await fd.close();
 
-      this._logger.info(`Uploading part ${partNumber} (bytes ${offset}-${offset + currentChunkSize - 1})`);
+      this._logger.info(
+        `Uploading part ${partNumber} (bytes ${offset}-${offset + currentChunkSize - 1})`,
+      );
 
       // await this.uploadChunk(buffer, partNumber);
 
       await this.retryUploadWithResilience(
         () => this.uploadChunk(buffer, partNumber),
-        partNumber
+        partNumber,
       );
 
       offset += currentChunkSize;
@@ -359,14 +498,21 @@ class DiskUploader implements IUploader {
 
     await this.finish();
 
-    this._logger.info(`Finished uploading ${partNumber - 1} parts.`, this._userId, this._teamId);
+    this._logger.info(
+      `Finished uploading ${partNumber - 1} parts.`,
+      this._userId,
+      this._teamId,
+    );
   }
 
   private delayPromise(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  private async retryUploadWithResilience(fn: () => Promise<void>, partNumber: number) {
+  private async retryUploadWithResilience(
+    fn: () => Promise<void>,
+    partNumber: number,
+  ) {
     let attempt = 0;
     while (attempt < this.MAX_CHUNK_UPLOAD_RETRIES) {
       try {
@@ -379,25 +525,36 @@ class DiskUploader implements IUploader {
           throw err;
         }
         if (attempt < this.MAX_CHUNK_UPLOAD_RETRIES) {
-          const delay = this.RETRY_UPLOAD_DELAY_BASE_MS * Math.pow(2, attempt - 1);
-          this._logger.info(`Retry part ${partNumber}, attempt ${attempt} after ${delay}ms`);
+          const delay =
+            this.RETRY_UPLOAD_DELAY_BASE_MS * Math.pow(2, attempt - 1);
+          this._logger.info(
+            `Retry part ${partNumber}, attempt ${attempt} after ${delay}ms`,
+          );
           await this.delayPromise(delay);
         } else {
-          this._logger.info(`Failed to upload part ${partNumber} after ${this.MAX_CHUNK_UPLOAD_RETRIES} attempts.`);
+          this._logger.info(
+            `Failed to upload part ${partNumber} after ${this.MAX_CHUNK_UPLOAD_RETRIES} attempts.`,
+          );
           throw err;
         }
       }
     }
   }
 
-  private static async setupDirectory(folderPath: string, userId: string, logger: Logger) {
+  private static async setupDirectory(
+    folderPath: string,
+    userId: string,
+    logger: Logger,
+  ) {
     try {
       if (!fs.existsSync(folderPath)) {
         logger.info('Temp Directory does not exist. Creating...', userId);
         await fs.promises.mkdir(folderPath, { recursive: true });
-        logger.info('Temp Directory does not exist. Creation success...', userId);
-      }
-      else {
+        logger.info(
+          'Temp Directory does not exist. Creation success...',
+          userId,
+        );
+      } else {
         logger.info('Found the temp directory already...', userId);
       }
     } catch (error) {
@@ -408,10 +565,26 @@ class DiskUploader implements IUploader {
 
   private async deleteTempFileAsync(): Promise<void> {
     try {
-      const filePath = DiskUploader.getFilePath(this._userId, this._tempFileId, this.fileExtension);
+      const filePath = DiskUploader.getFilePath(
+        this._userId,
+        this._tempFileId,
+        this.fileExtension,
+      );
       const absPath = path.resolve(filePath);
       await fs.promises.unlink(absPath);
-      this._logger.info(`Temp File deleted from disk: ${absPath}`, this._userId);
+      this._logger.info(
+        `Temp File deleted from disk: ${absPath}`,
+        this._userId,
+      );
+
+      // Delete transcript file if exists
+      const transcriptPath = DiskUploader.getTranscriptFilePath(
+        this._userId,
+        this._tempFileId,
+      );
+      if (fs.existsSync(transcriptPath)) {
+        await fs.promises.unlink(transcriptPath);
+      }
     } catch (error) {
       this._logger.warn('Could not clean up temp file:', this._userId, error);
     }
@@ -419,7 +592,11 @@ class DiskUploader implements IUploader {
 
   private async tempFileExists(): Promise<boolean> {
     try {
-      const filePath = DiskUploader.getFilePath(this._userId, this._tempFileId, this.fileExtension);
+      const filePath = DiskUploader.getFilePath(
+        this._userId,
+        this._tempFileId,
+        this.fileExtension,
+      );
       await fs.promises.access(filePath);
       return true;
     } catch {
@@ -456,8 +633,12 @@ class DiskUploader implements IUploader {
       }
 
       return true;
-    } catch(err) {
-      this._logger.info('Critical: Failed to finalise temp file write...', this._userId, err);
+    } catch (err) {
+      this._logger.info(
+        'Critical: Failed to finalise temp file write...',
+        this._userId,
+        err,
+      );
       return false;
     }
   }
@@ -479,7 +660,10 @@ class DiskUploader implements IUploader {
           if (attempt >= this.MAX_FILE_UPLOAD_RETRIES) {
             throw err;
           }
-          this._logger.info('NoSuchUpload detected, restarting upload session...', this._userId);
+          this._logger.info(
+            'NoSuchUpload detected, restarting upload session...',
+            this._userId,
+          );
         } else {
           throw err;
         }
@@ -491,13 +675,22 @@ class DiskUploader implements IUploader {
 
   private async uploadRecordingToObjectStorage(): Promise<boolean> {
     const provider = getStorageProvider();
-    this._logger.info(`Uploading recording to object storage using provider: ${provider.name}...`);
+    this._logger.info(
+      `Uploading recording to object storage using provider: ${provider.name}...`,
+    );
 
-    const filePath = DiskUploader.getFilePath(this._userId, this._tempFileId, this.fileExtension);
+    const filePath = DiskUploader.getFilePath(
+      this._userId,
+      this._tempFileId,
+      this.fileExtension,
+    );
     const chunkSize = this.UPLOAD_CHUNK_SIZE;
 
     // Compose key to preserve existing S3 layout for parity
-    const fileName = fileNameTemplate(this._namePrefix, getTimeString(this._timezone, this._logger));
+    const fileName = fileNameTemplate(
+      this._namePrefix,
+      getTimeString(this._timezone, this._logger),
+    );
     const key = `meeting-bot/${this._userId}/${fileName}${this.fileExtension}`;
 
     // Validate provider configuration before attempting upload
@@ -506,7 +699,9 @@ class DiskUploader implements IUploader {
     const maxAttempts = 2;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        this._logger.info(`Object storage upload attempt ${attempt} of ${maxAttempts} via ${provider.name}.`);
+        this._logger.info(
+          `Object storage upload attempt ${attempt} of ${maxAttempts} via ${provider.name}.`,
+        );
         const startedAt = Date.now();
         const uploadSuccess = await provider.uploadFile({
           filePath,
@@ -521,7 +716,9 @@ class DiskUploader implements IUploader {
           throw new Error(`Failed to upload recording to ${provider.name}`);
         }
         const durationMs = Date.now() - startedAt;
-        this._logger.info(`Object storage upload success via ${provider.name}. Duration: ${durationMs} ms, Size: unknown (streamed). Key: ${key}`);
+        this._logger.info(
+          `Object storage upload success via ${provider.name}. Duration: ${durationMs} ms, Size: unknown (streamed). Key: ${key}`,
+        );
 
         // Build blobUrl + storage details for notifications
         try {
@@ -529,11 +726,14 @@ class DiskUploader implements IUploader {
             const s3cfg = config.s3CompatibleStorage;
             const uploadCfg = {
               endpoint: s3cfg.endpoint,
-              region: s3cfg.region!,
-              bucket: s3cfg.bucket!,
+              region: s3cfg.region || '',
+              bucket: s3cfg.bucket || '',
               forcePathStyle: !!s3cfg.forcePathStyle,
             };
-            this.lastUploadedBlobUrl = this.buildS3CompatibleUrl(uploadCfg, key);
+            this.lastUploadedBlobUrl = this.buildS3CompatibleUrl(
+              uploadCfg,
+              key,
+            );
             this.lastStorageDetails = {
               provider: 's3',
               bucket: s3cfg.bucket,
@@ -546,11 +746,16 @@ class DiskUploader implements IUploader {
           } else if (provider.name === 'azure') {
             // Prefer signed URL if method is available
             let url: string | undefined;
-            if (typeof (provider as any).getSignedUrl === 'function') {
+            if (typeof provider.getSignedUrl === 'function') {
               try {
-                url = await (provider as any).getSignedUrl(key, { expiresInSeconds: config.azureBlobStorage.signedUrlTtlSeconds });
+                url = await provider.getSignedUrl(key, {
+                  expiresInSeconds: config.azureBlobStorage.signedUrlTtlSeconds,
+                });
               } catch (e) {
-                this._logger.warn('Failed to generate signed URL for Azure blob, falling back to public URL (may be inaccessible without SAS)', e as any);
+                this._logger.warn(
+                  'Failed to generate signed URL for Azure blob, falling back to public URL (may be inaccessible without SAS)',
+                  e,
+                );
               }
             }
             // Construct canonical URL if no signed URL available
@@ -573,15 +778,24 @@ class DiskUploader implements IUploader {
             };
           }
         } catch (metaErr) {
-          this._logger.warn('Unable to compute storage metadata/url for notification', metaErr as any);
+          this._logger.warn(
+            'Unable to compute storage metadata/url for notification',
+            metaErr,
+          );
         }
         return true;
       } catch (err) {
         if (attempt >= maxAttempts) {
-          this._logger.error(`Permanently failed to upload recording to object storage (${provider.name}) after ${maxAttempts} attempts`, err);
+          this._logger.error(
+            `Permanently failed to upload recording to object storage (${provider.name}) after ${maxAttempts} attempts`,
+            err,
+          );
           throw err;
         } else {
-          this._logger.error(`Failed to upload recording to object storage (${provider.name}) attempt ${attempt} of ${maxAttempts}`, err);
+          this._logger.error(
+            `Failed to upload recording to object storage (${provider.name}) attempt ${attempt} of ${maxAttempts}`,
+            err,
+          );
           const delay = this.RETRY_UPLOAD_DELAY_BASE_MS * Math.pow(2, attempt);
           await this.delayPromise(delay);
         }
@@ -591,7 +805,15 @@ class DiskUploader implements IUploader {
     return false;
   }
 
-  private buildS3CompatibleUrl(uploadConfig: { endpoint?: string; region: string; bucket: string; forcePathStyle: boolean; }, key: string): string | undefined {
+  private buildS3CompatibleUrl(
+    uploadConfig: {
+      endpoint?: string;
+      region: string;
+      bucket: string;
+      forcePathStyle: boolean;
+    },
+    key: string,
+  ): string | undefined {
     try {
       const safeKey = encodeURI(key);
       if (uploadConfig.endpoint) {
@@ -611,22 +833,31 @@ class DiskUploader implements IUploader {
     }
   }
 
-  public async uploadRecordingToRemoteStorage(options?: { forceUpload?: boolean }) {
+  public async uploadRecordingToRemoteStorage(options?: {
+    forceUpload?: boolean;
+  }) {
     try {
       if (typeof options?.forceUpload === 'boolean') {
         this.forceUpload = options.forceUpload;
       }
 
-      if (!await this.tempFileExists()) {
-        throw new Error(`Unable to access the temp recording file on disk: ${this._userId} ${this._botId}`);
+      if (!(await this.tempFileExists())) {
+        throw new Error(
+          `Unable to access the temp recording file on disk: ${this._userId} ${this._botId}`,
+        );
       }
 
       const goodToGo = await this.finalizeDiskWriting();
 
       if (this.forceUpload) {
-        this._logger.info('Force upload is enabled. Ignoring disk writing check results...', { goodToGo });
+        this._logger.info(
+          'Force upload is enabled. Ignoring disk writing check results...',
+          { goodToGo },
+        );
       } else if (!goodToGo) {
-        throw new Error(`Unable to finalise the temp recording file: ${this._userId} ${this._botId}`);
+        throw new Error(
+          `Unable to finalise the temp recording file: ${this._userId} ${this._botId}`,
+        );
       }
 
       let uploadResult = false;
@@ -637,13 +868,14 @@ class DiskUploader implements IUploader {
         // Route to selected object storage provider (S3 or Azure) based on configuration
         uploadResult = await this.uploadRecordingToObjectStorage();
       } else {
-        throw new Error(`Unsupported UPLOADER_TYPE configuration: ${config.uploaderType}`);
+        throw new Error(
+          `Unsupported UPLOADER_TYPE configuration: ${config.uploaderType}`,
+        );
       }
 
-      // Delete temp file after the upload is finished
-      await this.deleteTempFileAsync();
-
       // Send optional notifications on success
+      // NOTE: deleteTempFileAsync() is called AFTER the webhook is sent so the
+      // transcript file still exists when we build the payload below.
       if (uploadResult) {
         try {
           const payload: RecordingCompletedPayload = {
@@ -656,19 +888,104 @@ class DiskUploader implements IUploader {
               userId: this._userId,
               teamId: this._teamId,
               botId: this._botId,
+              // eventId is used by the server as interviewId to link recording to interview
+              eventId: this._eventId,
+              interviewId: this._eventId,
               contentType: this.contentType,
               uploaderType: config.uploaderType,
             },
           };
+
+          // If transcript exists, upload it too and add to payload
+          const transcriptPath = DiskUploader.getTranscriptFilePath(
+            this._userId,
+            this._tempFileId,
+          );
+          if (fs.existsSync(transcriptPath)) {
+            try {
+              // Read and parse transcript for payload
+              const transcriptContent = await fs.promises.readFile(
+                transcriptPath,
+                'utf8',
+              );
+              const transcriptLines = transcriptContent.trim().split('\n');
+              const transcriptData = transcriptLines
+                .map((line) => {
+                  try {
+                    return JSON.parse(line);
+                  } catch (e) {
+                    return null;
+                  }
+                })
+                .filter((entry) => entry !== null);
+
+              payload.transcript = transcriptData;
+
+              // For simplicity, we can upload it or just pass the content if small.
+              // But generally we should upload.
+              // Since `provider` logic is complex reuse, let's just use the provider to upload the transcript file
+              const provider = getStorageProvider();
+              const fileName = fileNameTemplate(
+                this._namePrefix,
+                getTimeString(this._timezone, this._logger),
+              );
+              const key = `meeting-bot/${this._userId}/${fileName}.json`;
+
+              // Assuming provider uploadFile works generically
+              await provider.uploadFile({
+                filePath: transcriptPath,
+                key,
+                contentType: 'application/json',
+                logger: this._logger,
+                partSize: 5 * 1024 * 1024,
+              });
+
+              // Construct URL (reusing existing logic or simplified)
+              let transcriptUrl = '';
+              if (provider.name === 's3') {
+                const s3cfg = config.s3CompatibleStorage;
+                const uploadCfg = {
+                  endpoint: s3cfg.endpoint,
+                  region: s3cfg.region || '',
+                  bucket: s3cfg.bucket || '',
+                  forcePathStyle: !!s3cfg.forcePathStyle,
+                };
+                transcriptUrl = this.buildS3CompatibleUrl(uploadCfg, key) || '';
+              } else if (provider.name === 'azure') {
+                // Start simplified check
+                const account = config.azureBlobStorage.accountName;
+                const container = config.azureBlobStorage.container;
+                if (account && container) {
+                  transcriptUrl = `https://${account}.blob.core.windows.net/${container}/${encodeURI(key)}`;
+                }
+              }
+
+              payload.transcriptUrl = transcriptUrl; // Add to payload
+            } catch (tErr) {
+              this._logger.warn('Failed to upload transcript file', tErr);
+            }
+          }
+
           await notifyRecordingCompleted(payload, this._logger);
         } catch (notifyErr) {
-          this._logger.warn('Recording completed notification failed', notifyErr as any);
+          this._logger.warn(
+            'Recording completed notification failed',
+            notifyErr,
+          );
         }
       }
 
+      // Delete temp files AFTER the webhook has been sent (transcript must
+      // still exist when we build the payload above).
+      await this.deleteTempFileAsync();
+
       return uploadResult;
     } catch (err) {
-      this._logger.info('Unable to upload recording to server...', { error: err, userId: this._userId, teamId: this._teamId });
+      this._logger.info('Unable to upload recording to server...', {
+        error: err,
+        userId: this._userId,
+        teamId: this._teamId,
+      });
       return false;
     }
   }

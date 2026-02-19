@@ -10,39 +10,52 @@ export class JobStore {
   private shutdownRequested: boolean = false;
 
   async addJob<T>(
-    task: () => Promise<T>, 
+    task: () => Promise<T>,
     logger: Logger,
-    retryCount: number = 0
+    retryCount: number = 0,
   ): Promise<{ accepted: boolean }> {
     if (this.isRunning || this.shutdownRequested) {
       return { accepted: false };
     }
 
     this.isRunning = true;
-    
-    // Execute the task asynchronously without waiting for completion
-    this.executeTaskWithRetry(task, logger, retryCount).then(() => {
-      logger.info('LogBasedMetric Bot has finished recording meeting successfully.');
-    }).catch((error) => {
-      const errorType = getErrorType(error);
-      if (error instanceof KnownError) {
-        logger.error('KnownError JobStore is permanently exiting:', { error });
-      } else {
-        logger.error('Error executing task after multiple retries:', { error });
-      }
-      logger.error(`LogBasedMetric Bot has permanently failed. [errorType: ${errorType}]`);
-    }).finally(() => {
-      this.isRunning = false;
-    });
 
-    logger.info('LogBasedMetric Bot job has been queued and started recording meeting.');
+    // Execute the task asynchronously without waiting for completion
+    this.executeTaskWithRetry(task, logger, retryCount)
+      .then(() => {
+        logger.info(
+          'LogBasedMetric Bot has finished recording meeting successfully.',
+        );
+      })
+      .catch((error) => {
+        const errorType = getErrorType(error);
+        if (error instanceof KnownError) {
+          logger.error('KnownError JobStore is permanently exiting:', {
+            error,
+          });
+        } else {
+          logger.error('Error executing task after multiple retries:', {
+            error,
+          });
+        }
+        logger.error(
+          `LogBasedMetric Bot has permanently failed. [errorType: ${errorType}]`,
+        );
+      })
+      .finally(() => {
+        this.isRunning = false;
+      });
+
+    logger.info(
+      'LogBasedMetric Bot job has been queued and started recording meeting.',
+    );
     return { accepted: true };
   }
 
   private async executeTaskWithRetry<T>(
     task: () => Promise<T>,
     logger: Logger,
-    retryCount: number
+    retryCount: number,
   ): Promise<void> {
     try {
       await task();
@@ -52,8 +65,21 @@ export class JobStore {
         throw error;
       }
 
-      if (error instanceof KnownError && error.retryable && (retryCount + 1) >= error.maxRetries) {
-        logger.error(`KnownError: ${error.maxRetries} tries consumed:`, error.name, error.message);
+      if (
+        error instanceof KnownError &&
+        error.retryable &&
+        retryCount + 1 >= error.maxRetries
+      ) {
+        logger.error(
+          `KnownError: ${error.maxRetries} tries consumed:`,
+          error.name,
+          error.message,
+        );
+        throw error;
+      }
+
+      if (getErrorType(error) === 'TargetClosedError') {
+        logger.error('TargetClosedError is not retryable:', error);
         throw error;
       }
 
@@ -98,7 +124,7 @@ export class JobStore {
     }
 
     console.log('Waiting for ongoing tasks to complete...');
-    
+
     return new Promise<void>((resolve) => {
       const checkCompletion = () => {
         if (!this.isRunning) {
@@ -111,4 +137,4 @@ export class JobStore {
       checkCompletion();
     });
   }
-} 
+}

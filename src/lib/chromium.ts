@@ -3,6 +3,8 @@ import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import config from '../config';
 import { getCorrelationIdLog } from '../util/logger';
+import path from 'path';
+import { tmpdir } from 'os';
 
 const stealthPlugin = StealthPlugin();
 stealthPlugin.enabledEvasions.delete('iframe.contentWindow');
@@ -151,7 +153,7 @@ async function createBrowserContext(
     // Record video only in development for debugging
     ...(process.env.NODE_ENV === 'development' && {
       recordVideo: {
-        dir: './debug-videos/',
+        dir: path.join(tmpdir(), 'meeting-bot', 'debug-videos'),
         size: size,
       },
     }),

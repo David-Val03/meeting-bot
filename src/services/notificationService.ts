@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { Logger } from 'winston';
 import config from '../config';
 import { createClient, RedisClientType } from 'redis';
+import { TranscriptRawEntry } from '../types';
 
 export interface RecordingCompletedPayload {
   recordingId: string;
@@ -10,7 +11,10 @@ export interface RecordingCompletedPayload {
   status: 'completed' | string;
   blobUrl?: string; // generic storage url (S3, Azure blob, etc.)
   timestamp: string; // ISO string
+  statusCode?: number;
   metadata?: Record<string, any>;
+  transcriptUrl?: string;
+  transcript?: TranscriptRawEntry[];
 }
 
 function signPayload(body: string, secret?: string): string | undefined {
@@ -42,7 +46,10 @@ async function sendWebhook(payload: RecordingCompletedPayload, logger: Logger) {
   }
 }
 
-async function rpushToRedisList(payload: RecordingCompletedPayload, logger: Logger) {
+async function rpushToRedisList(
+  payload: RecordingCompletedPayload,
+  logger: Logger,
+) {
   if (!config.notifyRedisEnabled) return;
 
   const uri = config.notifyRedisUri || config.redisUri;
@@ -59,7 +66,9 @@ async function rpushToRedisList(payload: RecordingCompletedPayload, logger: Logg
   }
   // Enforce DB not 0: if 0 is set, switch to 1 and warn
   if (db === 0) {
-    logger.warn('NOTIFY_REDIS_DB was set to 0. Switching to DB 1 as DB 0 is not allowed for notifications.');
+    logger.warn(
+      'NOTIFY_REDIS_DB was set to 0. Switching to DB 1 as DB 0 is not allowed for notifications.',
+    );
     db = 1;
   }
 
@@ -70,7 +79,9 @@ async function rpushToRedisList(payload: RecordingCompletedPayload, logger: Logg
     await client.connect();
     const body = JSON.stringify(payload);
     await client.rPush(list, body);
-    logger.info(`Recording completed payload pushed to Redis list ${list} on DB ${db}.`);
+    logger.info(
+      `Recording completed payload pushed to Redis list ${list} on DB ${db}.`,
+    );
   } catch (err) {
     logger.error('Failed to push recording notification to Redis', err as any);
   } finally {
@@ -80,7 +91,10 @@ async function rpushToRedisList(payload: RecordingCompletedPayload, logger: Logg
   }
 }
 
-export async function notifyRecordingCompleted(payload: RecordingCompletedPayload, logger: Logger) {
+export async function notifyRecordingCompleted(
+  payload: RecordingCompletedPayload,
+  logger: Logger,
+) {
   // both notification channels are optional; do both if enabled
   await Promise.allSettled([
     sendWebhook(payload, logger),

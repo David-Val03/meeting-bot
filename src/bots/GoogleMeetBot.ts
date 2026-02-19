@@ -1,3 +1,4 @@
+/* eslint-disable quotes */
 import { JoinParams } from './AbstractMeetBot';
 import { BotStatus, WaitPromise } from '../types';
 import config from '../config';
@@ -269,6 +270,12 @@ export class GoogleMeetBot extends MeetBotBase {
 
     this._logger.info('Waiting for 10 seconds...');
     await this.page.waitForTimeout(10000);
+
+    // Try to mute before joining
+    await this.ensureMuted(
+      'div[role="button"][aria-label="Turn off microphone"]',
+      'pre-join',
+    );
 
     this._logger.info('Filling the input field with the name...');
     await this.page.fill(
@@ -699,6 +706,62 @@ export class GoogleMeetBot extends MeetBotBase {
       });
     }
 
+    // Try to mute after joining
+    await this.ensureMuted(
+      'button[aria-label="Turn off microphone"]',
+      'post-join',
+    );
+
+    // Turn on captions
+    try {
+      this._logger.info('Attempting to turn on captions...');
+
+      // Debug: Log all buttons to find the right one
+      const buttons = await this.page.evaluate(() => {
+        return Array.from(document.querySelectorAll('button')).map((b) => ({
+          ariaLabel: b.getAttribute('aria-label'),
+          text: b.innerText,
+          visible: b.offsetParent !== null,
+        }));
+      });
+      const potentialCaptionButtons = buttons.filter(
+        (b) =>
+          b.ariaLabel?.toLowerCase().includes('caption') ||
+          b.ariaLabel?.toLowerCase().includes('cc') ||
+          b.text?.toLowerCase().includes('caption'),
+      );
+      this._logger.info('Potential caption buttons found:', {
+        potentialCaptionButtons,
+      });
+
+      const captionButton = this.page.locator(
+        'button[aria-label="Turn on captions"]',
+      );
+      if ((await captionButton.count()) > 0) {
+        await captionButton.click();
+        this._logger.info('Clicked "Turn on captions" button');
+      } else {
+        this._logger.warn(
+          '"Turn on captions" button not found matching exact selector',
+        );
+
+        // Try fallback click if we found a potential candidate in debug
+        const fallback = this.page
+          .locator(
+            'button[aria-label*="Turn on captions"], button[aria-label*="captions"]',
+          )
+          .first();
+        if ((await fallback.count()) > 0) {
+          this._logger.info('Attempting to click fallback caption button...');
+          await fallback.click();
+        }
+      }
+    } catch (error) {
+      this._logger.warn('Failed to turn on captions', { error });
+    }
+
+    // Recording the meeting page (Line 703)
+
     // Recording the meeting page
     this._logger.info('Begin recording...');
     await this.recordMeetingPage({
@@ -752,6 +815,14 @@ export class GoogleMeetBot extends MeetBotBase {
 
         const buffer = Buffer.from(data, 'base64');
         await uploader.saveDataToTempFile(buffer);
+      },
+    );
+
+    await this.page.exposeFunction(
+      'screenAppSendTranscript',
+      async (transcriptData: any) => {
+        // Validation ideally via secret, or trust page context since we control injection
+        await uploader.saveTranscript(transcriptData);
       },
     );
 
@@ -944,6 +1015,14 @@ export class GoogleMeetBot extends MeetBotBase {
               }
             }
 
+            // Flush last in-flight transcript utterance before closing
+            if ((window as any).__transcriptFlush) {
+              (window as any).__transcriptFlush();
+            }
+            // Clear transcript poll interval
+            if ((window as any).__transcriptPollInterval) {
+              clearInterval((window as any).__transcriptPollInterval);
+            }
             // Begin browser cleanup
             (window as any).screenAppMeetEnd(slightlySecretId);
           };
@@ -1350,6 +1429,35 @@ export class GoogleMeetBot extends MeetBotBase {
                     }
                   });
                 }
+
+                // Dismiss the Google Meet "You are now presenting" bar.
+                // This appears because getDisplayMedia(preferCurrentTab:true) tells Chrome to
+                // signal tab capture to Google Meet, making the bot appear as a presenter.
+                // We immediately click "Stop presenting" to cancel the presentation.
+                const stopPresentingBtn = Array.from(
+                  document.querySelectorAll('button'),
+                ).find(
+                  (btn) =>
+                    btn?.offsetParent !== null &&
+                    (btn
+                      .getAttribute('aria-label')
+                      ?.toLowerCase()
+                      .includes('stop presenting') ||
+                      btn
+                        .getAttribute('aria-label')
+                        ?.toLowerCase()
+                        .includes('stop sharing') ||
+                      btn.innerText
+                        ?.toLowerCase()
+                        .includes('stop presenting') ||
+                      btn.innerText?.toLowerCase().includes('stop sharing')),
+                );
+                if (stopPresentingBtn) {
+                  console.log(
+                    '[BotRecorder] Dismissing "You are presenting" bar — stopping accidental screen share...',
+                  );
+                  (stopPresentingBtn as HTMLElement).click();
+                }
               } catch (error) {
                 lastDimissError = error;
                 dismissModalErrorCount += 1;
@@ -1404,11 +1512,26 @@ export class GoogleMeetBot extends MeetBotBase {
                   return false;
                 }
 
-                // Check for basic Google Meet UI elements
+                // Check for basic Google Meet UI elements.
+                // NOTE: During screen share Google hides the bottom toolbar briefly,
+                // so we check multiple selectors to avoid a false-positive "left meeting".
                 const hasMeetElements =
                   document.querySelector('button[aria-label="People"]') !==
                     null ||
                   document.querySelector('button[aria-label="Leave call"]') !==
+                    null ||
+                  // Shown during presentation mode when someone shares screen
+                  document.querySelector(
+                    'button[aria-label="Stop presenting"]',
+                  ) !== null ||
+                  document.querySelector(
+                    'button[aria-label="End presentation"]',
+                  ) !== null ||
+                  // Persistent toolbar icons visible in all Meet states
+                  document.querySelector(
+                    'button[aria-label="Chat with everyone"]',
+                  ) !== null ||
+                  document.querySelector('[data-meeting-ended="false"]') !==
                     null;
 
                 if (!hasMeetElements) {
@@ -1442,6 +1565,295 @@ export class GoogleMeetBot extends MeetBotBase {
           detectModalsAndDismiss();
 
           detectMeetingIsOnAValidPage();
+
+          // Transcript Scraping Logic
+          // Uses multiple strategies since Google Meet class names change frequently.
+          const startTranscriptScraping = () => {
+            console.log('Starting transcript scraping (multi-strategy)...');
+
+            /**
+             * Core function: try every known strategy to extract the current
+             * caption text + speaker name visible on screen.
+             */
+            let _diagTick = 0;
+            const extractCaption = (): {
+              speaker: string;
+              text: string;
+            } | null => {
+              _diagTick++;
+              const verbose = _diagTick % 5 === 1; // log every ~10 s (5 × 2s poll)
+
+              // ── Strategy 1: Google Meet captions container (confirmed from real DOM) ──
+              // The outer container is div[aria-label="Captions"] — this ARIA attribute
+              // is stable. Inside each caption entry (.nMcdL > .bj4p3b):
+              //   speaker:  span.NWpY1d  (or div.KcIKyf span)
+              //   text:     div.ygicle   (or div.VbkSUe as a fallback class)
+              const captionsRoot = document.querySelector(
+                'div[aria-label="Captions"]',
+              );
+              if (verbose) {
+                console.log(
+                  `[Transcript:diag] S1 Captions root found: ${!!captionsRoot}`,
+                );
+              }
+              if (captionsRoot) {
+                // Each caption entry is a .nMcdL block inside the root
+                const entries =
+                  captionsRoot.querySelectorAll('.nMcdL, .bj4p3b');
+                if (verbose) {
+                  console.log(
+                    `[Transcript:diag] S1 entries found: ${entries.length}`,
+                  );
+                }
+                for (const entry of Array.from(entries)) {
+                  const textEl = entry.querySelector(
+                    'div.ygicle, div.VbkSUe, div.iTTPOb',
+                  ) as HTMLElement | null;
+                  const speakerEl = entry.querySelector(
+                    'span.NWpY1d, div.KcIKyf span, div.adE6rb span',
+                  ) as HTMLElement | null;
+                  const text = textEl?.innerText?.trim() ?? '';
+                  const speaker = speakerEl?.innerText?.trim() ?? '';
+                  if (verbose) {
+                    console.log(
+                      `[Transcript:diag] S1 entry speaker="${speaker}" text="${text.slice(0, 80)}"`,
+                    );
+                  }
+                  if (text) {
+                    return { speaker, text };
+                  }
+                }
+              }
+
+              // ── Strategy 2: aria-live / role="status" regions ──
+              // NOTE: only fire when the caption container (S1) has text; aria-live
+              // regions in Google Meet also emit UI *notifications* ("has left the
+              // meeting", connectivity warnings, etc.) which must be filtered out.
+              const UI_NOTIFICATION_PATTERNS = [
+                'has left the meeting',
+                'has joined the meeting',
+                'is in the waiting room',
+                'no one else is in this meeting',
+                'your internet connection',
+                'internet connection is unstable',
+                'is having connection issues',
+                'is now presenting',
+                'stopped presenting',
+                'jump to bottom',
+                'you are muted',
+                'unmute yourself',
+                'meeting code',
+                'get help here',
+                'go to the more options',
+                'has been admitted',
+              ];
+              const ariaRegions = document.querySelectorAll(
+                '[aria-live="polite"], [aria-live="assertive"], [role="status"]',
+              );
+              if (verbose) {
+                console.log(
+                  `[Transcript:diag] S2 aria-live regions found: ${ariaRegions.length}`,
+                );
+                Array.from(ariaRegions).forEach((r, i) => {
+                  const t = (r as HTMLElement).innerText?.trim() ?? '';
+                  console.log(
+                    `[Transcript:diag] S2 region[${i}] len=${t.length} text="${t.slice(0, 80)}"`,
+                  );
+                });
+              }
+              for (const region of Array.from(ariaRegions)) {
+                const text = (region as HTMLElement).innerText?.trim() ?? '';
+                if (!text || text.length >= 500 || text.length <= 2) continue;
+                const tLower = text.toLowerCase();
+                const isNotification = UI_NOTIFICATION_PATTERNS.some((p) =>
+                  tLower.includes(p),
+                );
+                if (!isNotification) {
+                  return { speaker: '', text };
+                }
+              }
+
+              // ── Strategy 3: position-based bottom 35% of viewport ──
+              const vh = window.innerHeight;
+              const captionZoneTop = vh * 0.65;
+              const allDivs = Array.from(
+                document.querySelectorAll('div, span'),
+              );
+
+              const candidateTexts: string[] = [];
+              for (const el of allDivs) {
+                const rect = el.getBoundingClientRect();
+                if (
+                  rect.top >= captionZoneTop &&
+                  rect.bottom <= vh + 10 &&
+                  rect.width > 100
+                ) {
+                  const elHtml = el as HTMLElement;
+                  // Skip buttons and labelled controls (UI chrome)
+                  if (
+                    elHtml.tagName === 'BUTTON' ||
+                    elHtml.getAttribute('role') === 'button' ||
+                    elHtml.hasAttribute('aria-label')
+                  )
+                    continue;
+                  const ownText = Array.from(el.childNodes)
+                    .filter((n) => n.nodeType === Node.TEXT_NODE)
+                    .map((n) => n.textContent?.trim())
+                    .join(' ')
+                    .trim();
+                  // Require at least 20 chars — filters out meeting codes / nav labels
+                  if (ownText && ownText.length >= 20 && ownText.length < 300) {
+                    candidateTexts.push(ownText);
+                  } else if (
+                    elHtml.innerText &&
+                    elHtml.children.length === 0 &&
+                    elHtml.innerText.length >= 20 &&
+                    elHtml.innerText.length < 300
+                  ) {
+                    candidateTexts.push(elHtml.innerText.trim());
+                  }
+                }
+              }
+              if (verbose) {
+                console.log(
+                  `[Transcript:diag] S3 position-based vh=${vh} zone>${captionZoneTop} candidates: ${JSON.stringify(candidateTexts.slice(0, 5))}`,
+                );
+              }
+              if (candidateTexts.length > 0) {
+                return { speaker: '', text: candidateTexts.join(' ') };
+              }
+
+              if (verbose) {
+                console.log(
+                  '[Transcript:diag] All strategies returned null — no caption found',
+                );
+              }
+              return null;
+            };
+
+            // State for debounce logic
+            let pendingText = '';
+            let pendingSpeaker = '';
+            let lastCommittedText = '';
+            let debounceTimer: NodeJS.Timeout | null = null;
+
+            const clean = (text: string) =>
+              text.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+            const sendCommitted = (speaker: string, text: string) => {
+              const trimmed = text.trim();
+              if (!trimmed) return;
+              const transcriptData = {
+                type: 'transcript',
+                timestamp: new Date().toISOString(),
+                speaker: speaker || 'Unknown Speaker',
+                text: trimmed,
+              };
+              console.log(
+                `[Transcript] ${transcriptData.speaker}: ${trimmed.slice(0, 120)}`,
+              );
+              if ((window as any).screenAppSendTranscript) {
+                (window as any).screenAppSendTranscript(transcriptData);
+              } else {
+                console.log('TRANSCRIPT_DATA:', JSON.stringify(transcriptData));
+              }
+              lastCommittedText = trimmed;
+            };
+
+            const processCaption = () => {
+              try {
+                const result = extractCaption();
+
+                // Case 1: Caption disappeared
+                if (!result || !result.text) {
+                  if (debounceTimer) clearTimeout(debounceTimer);
+                  if (pendingText && pendingText !== lastCommittedText) {
+                    sendCommitted(pendingSpeaker, pendingText);
+                  }
+                  pendingText = '';
+                  pendingSpeaker = '';
+                  lastCommittedText = ''; // Reset so next utterance can start fresh
+                  return;
+                }
+
+                const { text, speaker } = result;
+                if (text === pendingText) return; // Exact match, no change
+
+                // Check if meaningful change (ignoring punctuation/case)
+                const normPending = clean(pendingText);
+                const normNew = clean(text);
+
+                // Case 2: Continuation/Correction (new text contains old text roughly)
+                // e.g. "Tested. In." -> "Tested. In the beginning."
+                if (
+                  normNew.startsWith(normPending) ||
+                  normNew.includes(normPending)
+                ) {
+                  pendingText = text;
+                  pendingSpeaker = speaker;
+
+                  // Debounce: Wait for 1s of stability before committing
+                  if (debounceTimer) clearTimeout(debounceTimer);
+                  debounceTimer = setTimeout(() => {
+                    if (pendingText && pendingText !== lastCommittedText) {
+                      sendCommitted(pendingSpeaker, pendingText);
+                    }
+                  }, 1000); // 1s stability per utterance
+                } else {
+                  // Case 3: Complete change/Reset (old utterance finished, new one started)
+                  // Commit the old pending text first if valid
+                  if (debounceTimer) clearTimeout(debounceTimer);
+                  if (pendingText && pendingText !== lastCommittedText) {
+                    sendCommitted(pendingSpeaker, pendingText);
+                  }
+
+                  // Start new utterance
+                  pendingText = text;
+                  pendingSpeaker = speaker;
+                  // Start debounce for new text
+                  debounceTimer = setTimeout(() => {
+                    if (pendingText && pendingText !== lastCommittedText) {
+                      sendCommitted(pendingSpeaker, pendingText);
+                    }
+                  }, 1000);
+                }
+              } catch (e) {
+                // Swallow
+              }
+            };
+
+            // Flush the last in-flight utterance
+            (window as any).__transcriptFlush = () => {
+              if (debounceTimer) clearTimeout(debounceTimer);
+              if (pendingText && pendingText !== lastCommittedText) {
+                sendCommitted(pendingSpeaker, pendingText);
+              }
+              pendingText = '';
+              pendingSpeaker = '';
+              lastCommittedText = '';
+            };
+
+            // MutationObserver — fires on DOM changes (immediate)
+            const observer = new MutationObserver(() => processCaption());
+            observer.observe(document.body, {
+              childList: true,
+              subtree: true,
+              characterData: true,
+            });
+
+            // setInterval fallback — polls every 2 s in case the observer misses rapid updates
+            const pollInterval = setInterval(processCaption, 2000);
+
+            console.log(
+              'Transcript observing started (MutationObserver + 2s poll)',
+            );
+
+            // Store cleanup ref on window so stopTheRecording can clear the interval
+            (window as any).__transcriptPollInterval = pollInterval;
+          };
+
+          // Call the function to start scraped logic
+          startTranscriptScraping();
 
           // Cancel this timeout when stopping the recording
           // Stop recording after `duration` minutes upper limit
@@ -1489,5 +1901,28 @@ export class GoogleMeetBot extends MeetBotBase {
     });
 
     await waitingPromise.promise;
+  }
+
+  private async ensureMuted(selector: string, location: string): Promise<void> {
+    try {
+      this._logger.info(`Attempting to mute at ${location}...`);
+      const muteButton = this.page.locator(selector).first();
+
+      if ((await muteButton.count()) > 0 && (await muteButton.isVisible())) {
+        const isMuted = await muteButton.getAttribute('data-is-muted');
+        if (isMuted === 'false') {
+          await muteButton.click();
+          this._logger.info(`Clicked mute button at ${location}`);
+          // Optional: wait and verify
+          await this.page.waitForTimeout(500);
+        } else {
+          this._logger.info(`Microphone already muted at ${location}`);
+        }
+      } else {
+        this._logger.info(`Mute button not found at ${location}`);
+      }
+    } catch (error) {
+      this._logger.warn(`Failed to mute at ${location}`, { error });
+    }
   }
 }

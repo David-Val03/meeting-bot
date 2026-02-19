@@ -69,6 +69,7 @@ const joinGoogleMeet = async (req: Request, res: Response) => {
         tempFileId,
         logger,
         url,
+        eventId,
       );
 
       // Create and join the meeting

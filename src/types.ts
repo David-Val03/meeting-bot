@@ -109,7 +109,8 @@ export interface IVFSResponse<T> {
 export type ContentType =
   | 'video/webm'
   | 'video/mp4'
-  | 'video/x-matroska';
+  | 'video/x-matroska'
+  | 'application/json';
 
 export const extensionToContentType: Record<string, ContentType> = {
   '.webm': 'video/webm',
@@ -123,17 +124,17 @@ export interface WaitPromise {
 }
 export type BotStatus = 'processing' | 'joined' | 'finished' | 'failed';
 export type WaitingAtLobbyCategory = {
-  category: 'WaitingAtLobby',
-  subCategory: 'Timeout' | 'StuckInLobby' | 'UserDeniedRequest',
-}
+  category: 'WaitingAtLobby';
+  subCategory: 'Timeout' | 'StuckInLobby' | 'UserDeniedRequest';
+};
 export type UnsupportedMeetingCategory = {
-  category: 'UnsupportedMeeting',
-  subCategory: 'RequiresSignIn' | 'RestrictedMeeting' | 'PrivateMeeting',
-}
+  category: 'UnsupportedMeeting';
+  subCategory: 'RequiresSignIn' | 'RestrictedMeeting' | 'PrivateMeeting';
+};
 
 export const categories = [
-  'WaitingAtLobby', 
-  'Recording', 
+  'WaitingAtLobby',
+  'Recording',
   'Integration',
   'UnsupportedMeeting',
   'Platform',
@@ -153,30 +154,20 @@ export const subCategories = [
   'BotNotResponding',
 ] as const;
 export const logCategories: {
-  category: typeof categories[number], 
-  subCategory: typeof subCategories[number][], 
+  category: (typeof categories)[number];
+  subCategory: (typeof subCategories)[number][];
 }[] = [
   {
     category: 'WaitingAtLobby',
-    subCategory: [
-      'Timeout',
-      'StuckInLobby',
-      'UserDeniedRequest'
-    ] as const,
+    subCategory: ['Timeout', 'StuckInLobby', 'UserDeniedRequest'] as const,
   },
   {
     category: 'Recording',
-    subCategory: [
-      'Start',
-      'End',
-    ] as const,
+    subCategory: ['Start', 'End'] as const,
   },
   {
     category: 'Integration',
-    subCategory: [
-      'InactiveIntegration',
-      'ReconnectRequired',
-    ] as const,
+    subCategory: ['InactiveIntegration', 'ReconnectRequired'] as const,
   },
   {
     category: 'UnsupportedMeeting',
@@ -188,13 +179,26 @@ export const logCategories: {
   },
   {
     category: 'Platform',
-    subCategory: [
-      'BotCrashed',
-      'BotNotResponding',
-    ] as const,
+    subCategory: ['BotCrashed', 'BotNotResponding'] as const,
   },
 ] as const;
-export type LogCategory = typeof logCategories[number]['category'];
-export type LogSubCategory<C extends LogCategory> = (typeof logCategories[number] & { category: C })['subCategory'][number];
+export type LogCategory = (typeof logCategories)[number]['category'];
+export type LogSubCategory<C extends LogCategory> =
+  ((typeof logCategories)[number] & { category: C })['subCategory'][number];
 
 export type UploaderType = 'screenapp' | 's3';
+
+export interface TranscriptRawEntry {
+  type: 'transcript';
+  timestamp: string;
+  speaker: string;
+  text: string;
+}
+
+export interface TranscriptData {
+  entries: TranscriptRawEntry[];
+  metadata?: {
+    meetingLink?: string;
+    botId?: string;
+  };
+}
