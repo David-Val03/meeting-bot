@@ -137,7 +137,6 @@ export class GoogleMeetBot extends MeetBotBase {
     botId,
     pushState,
     uploader,
-    audioOnly,
   }: JoinParams & { pushState(state: BotStatus): void }): Promise<void> {
     this._logger.info('Launching browser...');
 
@@ -770,7 +769,6 @@ export class GoogleMeetBot extends MeetBotBase {
       userId,
       botId,
       uploader,
-      audioOnly,
     });
 
     pushState('finished');
@@ -784,14 +782,12 @@ export class GoogleMeetBot extends MeetBotBase {
     eventId,
     botId,
     uploader,
-    audioOnly,
   }: {
     teamId: string;
     userId: string;
     eventId?: string;
     botId?: string;
     uploader: IUploader;
-    audioOnly?: boolean;
   }): Promise<void> {
     const duration = config.maxRecordingDuration * 60 * 1000;
     const inactivityLimit = config.inactivityLimit * 60 * 1000;
@@ -847,22 +843,18 @@ export class GoogleMeetBot extends MeetBotBase {
         inactivityLimit,
         userId,
         slightlySecretId,
-        activateInactivityDetectionAfter,
         activateInactivityDetectionAfterMinutes,
         primaryMimeType,
         secondaryMimeType,
-        audioOnly,
       }: {
         teamId: string;
         userId: string;
         duration: number;
         inactivityLimit: number;
         slightlySecretId: string;
-        activateInactivityDetectionAfter: string;
         activateInactivityDetectionAfterMinutes: number;
         primaryMimeType: string;
         secondaryMimeType: string;
-        audioOnly?: boolean;
       }) => {
         let timeoutId: NodeJS.Timeout;
         let inactivityParticipantDetectionTimeout: NodeJS.Timeout;
@@ -883,10 +875,7 @@ export class GoogleMeetBot extends MeetBotBase {
         };
 
         async function startRecording() {
-          console.log(
-            'Will activate the inactivity detection after',
-            activateInactivityDetectionAfter,
-          );
+          console.log('[Bot] Recording started.');
 
           // Check for the availability of the mediaDevices API
           if (
@@ -923,39 +912,16 @@ export class GoogleMeetBot extends MeetBotBase {
             );
           }
 
-          let recordingStream = stream;
-
-          if (audioOnly) {
-            console.log('Audio only mode active. Removing video tracks...');
-            stream.getVideoTracks().forEach((track) => track.stop());
-            recordingStream = new MediaStream(audioTracks);
-          }
+          const recordingStream = stream;
 
           let options: MediaRecorderOptions = {};
-
-          // Determine mime type based on mode
-          if (audioOnly) {
-            if (MediaRecorder.isTypeSupported('audio/webm')) {
-              options = { mimeType: 'audio/webm' };
-            } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
-              options = { mimeType: 'audio/mp4' };
-            } else {
-              console.warn(
-                'No specific audio mime type supported, letting browser choose default',
-              );
-            }
+          if (MediaRecorder.isTypeSupported(primaryMimeType)) {
+            options = { mimeType: primaryMimeType };
           } else {
-            if (MediaRecorder.isTypeSupported(primaryMimeType)) {
-              console.log(
-                `Media Recorder will use ${primaryMimeType} codecs...`,
-              );
-              options = { mimeType: primaryMimeType };
-            } else {
-              console.warn(
-                `Media Recorder did not find primary mime type codecs ${primaryMimeType}, Using fallback codecs ${secondaryMimeType}`,
-              );
-              options = { mimeType: secondaryMimeType };
-            }
+            console.warn(
+              `Primary codec ${primaryMimeType} not supported, using fallback ${secondaryMimeType}`,
+            );
+            options = { mimeType: secondaryMimeType };
           }
 
           const mediaRecorder = new MediaRecorder(recordingStream, {
@@ -1031,7 +997,6 @@ export class GoogleMeetBot extends MeetBotBase {
           let detectionFailures = 0;
           let loneTestDetectionActive = true;
           const maxDetectionFailures = 10; // Track up to 10 consecutive failures
-          let lastBadgeLogTime = 0; // Track last time we logged badge count
 
           function detectLoneParticipantResilient(): void {
             const re = /^[0-9]+$/;
@@ -1197,16 +1162,6 @@ export class GoogleMeetBot extends MeetBotBase {
                   contributors = getContributorsCount();
 
                   // Log participant count once per minute
-                  if (typeof contributors !== 'undefined') {
-                    const now = Date.now();
-                    if (now - lastBadgeLogTime > 60000) {
-                      console.log(
-                        'Participant detection check - Count:',
-                        contributors,
-                      );
-                      lastBadgeLogTime = now;
-                    }
-                  }
 
                   if (typeof contributors === 'undefined') {
                     detectionFailures++;
@@ -1214,11 +1169,7 @@ export class GoogleMeetBot extends MeetBotBase {
                       'Meet participant detection failed, retrying. Failure count:',
                       detectionFailures,
                     );
-                    // Log for debugging
                     if (detectionFailures >= maxDetectionFailures) {
-                      console.log('Persistent detection failures:', {
-                        bodyText: `${document.body.innerText?.toString()}`,
-                      });
                       loneTestDetectionActive = false;
                     }
                     retryWithBackoff();
@@ -1275,7 +1226,6 @@ export class GoogleMeetBot extends MeetBotBase {
               let silenceDuration = 0;
               let totalChecks = 0;
               let audioActivitySum = 0;
-              let lastActivityLogTime = 0;
 
               // Audio gain/volume
               const silenceThreshold = 10;
@@ -1290,23 +1240,6 @@ export class GoogleMeetBot extends MeetBotBase {
                     dataArray.reduce((a, b) => a + b) / dataArray.length;
                   audioActivitySum += audioActivity;
                   totalChecks++;
-
-                  // Log silence detection status once per minute
-                  const now = Date.now();
-                  if (now - lastActivityLogTime > 60000) {
-                    const avgActivity = (
-                      audioActivitySum / totalChecks
-                    ).toFixed(2);
-                    console.log(
-                      'Silence detection check - Avg:',
-                      avgActivity,
-                      'Current:',
-                      audioActivity.toFixed(2),
-                      'Threshold:',
-                      silenceThreshold,
-                    );
-                    lastActivityLogTime = now;
-                  }
 
                   if (audioActivity < silenceThreshold) {
                     silenceDuration += 100; // Check every 100ms
@@ -1382,10 +1315,6 @@ export class GoogleMeetBot extends MeetBotBase {
                     button?.innerText?.includes('Got it'),
                 );
                 if (dismissButtons.length > 0) {
-                  console.log(
-                    'Found "Got it" button, clicking it...',
-                    dismissButtons[0],
-                  );
                   dismissButtons[0].click();
                 }
 
@@ -1399,9 +1328,6 @@ export class GoogleMeetBot extends MeetBotBase {
                   bodyText.includes('Camera not found') ||
                   bodyText.includes('Make sure your camera is plugged in')
                 ) {
-                  console.log(
-                    'Found device notification (microphone/camera), attempting to dismiss...',
-                  );
                   // Look for close button (X) near the notification
                   const allButtons = Array.from(
                     document.querySelectorAll('button'),
@@ -1421,12 +1347,7 @@ export class GoogleMeetBot extends MeetBotBase {
 
                   // Click all visible close buttons to dismiss all notifications
                   closeButtons.forEach((btn) => {
-                    if (btn?.offsetParent !== null) {
-                      console.log(
-                        'Clicking close button for device notification...',
-                      );
-                      btn.click();
-                    }
+                    if (btn?.offsetParent !== null) btn.click();
                   });
                 }
 
@@ -1575,14 +1496,10 @@ export class GoogleMeetBot extends MeetBotBase {
              * Core function: try every known strategy to extract the current
              * caption text + speaker name visible on screen.
              */
-            let _diagTick = 0;
             const extractCaption = (): {
               speaker: string;
               text: string;
             } | null => {
-              _diagTick++;
-              const verbose = _diagTick % 5 === 1; // log every ~10 s (5 × 2s poll)
-
               // ── Strategy 1: Google Meet captions container (confirmed from real DOM) ──
               // The outer container is div[aria-label="Captions"] — this ARIA attribute
               // is stable. Inside each caption entry (.nMcdL > .bj4p3b):
@@ -1591,21 +1508,12 @@ export class GoogleMeetBot extends MeetBotBase {
               const captionsRoot = document.querySelector(
                 'div[aria-label="Captions"]',
               );
-              if (verbose) {
-                console.log(
-                  `[Transcript:diag] S1 Captions root found: ${!!captionsRoot}`,
-                );
-              }
               if (captionsRoot) {
                 // Each caption entry is a .nMcdL block inside the root
                 const entries =
                   captionsRoot.querySelectorAll('.nMcdL, .bj4p3b');
-                if (verbose) {
-                  console.log(
-                    `[Transcript:diag] S1 entries found: ${entries.length}`,
-                  );
-                }
-                for (const entry of Array.from(entries)) {
+                // Iterate backwards to read the newest, actively growing caption block
+                for (const entry of Array.from(entries).reverse()) {
                   const textEl = entry.querySelector(
                     'div.ygicle, div.VbkSUe, div.iTTPOb',
                   ) as HTMLElement | null;
@@ -1614,11 +1522,6 @@ export class GoogleMeetBot extends MeetBotBase {
                   ) as HTMLElement | null;
                   const text = textEl?.innerText?.trim() ?? '';
                   const speaker = speakerEl?.innerText?.trim() ?? '';
-                  if (verbose) {
-                    console.log(
-                      `[Transcript:diag] S1 entry speaker="${speaker}" text="${text.slice(0, 80)}"`,
-                    );
-                  }
                   if (text) {
                     return { speaker, text };
                   }
@@ -1646,21 +1549,14 @@ export class GoogleMeetBot extends MeetBotBase {
                 'get help here',
                 'go to the more options',
                 'has been admitted',
+                "you've been removed",
+                'you have been removed',
+                'seconds left',
+                'returning to home screen',
               ];
               const ariaRegions = document.querySelectorAll(
                 '[aria-live="polite"], [aria-live="assertive"], [role="status"]',
               );
-              if (verbose) {
-                console.log(
-                  `[Transcript:diag] S2 aria-live regions found: ${ariaRegions.length}`,
-                );
-                Array.from(ariaRegions).forEach((r, i) => {
-                  const t = (r as HTMLElement).innerText?.trim() ?? '';
-                  console.log(
-                    `[Transcript:diag] S2 region[${i}] len=${t.length} text="${t.slice(0, 80)}"`,
-                  );
-                });
-              }
               for (const region of Array.from(ariaRegions)) {
                 const text = (region as HTMLElement).innerText?.trim() ?? '';
                 if (!text || text.length >= 500 || text.length <= 2) continue;
@@ -1714,31 +1610,30 @@ export class GoogleMeetBot extends MeetBotBase {
                   }
                 }
               }
-              if (verbose) {
-                console.log(
-                  `[Transcript:diag] S3 position-based vh=${vh} zone>${captionZoneTop} candidates: ${JSON.stringify(candidateTexts.slice(0, 5))}`,
-                );
-              }
               if (candidateTexts.length > 0) {
                 return { speaker: '', text: candidateTexts.join(' ') };
-              }
-
-              if (verbose) {
-                console.log(
-                  '[Transcript:diag] All strategies returned null — no caption found',
-                );
               }
               return null;
             };
 
-            // State for debounce logic
+            // ── Transcript buffering: commit-on-block-reset ──────────────────────
+            // Strategy: Google Meet keeps ONE growing caption block. Words are
+            // appended live (~300ms apart). The block RESETS (clears & starts
+            // fresh) when the speaker pauses or a sentence ends naturally.
+            // We buffer the growing text and only commit when:
+            //   1. The caption disappears (block cleared)
+            //   2. The new text is shorter / diverges from the old text (reset)
+            //   3. The utterance exceeds MAX_UTTERANCE_CHARS (very long speech)
+            //   4. __transcriptFlush() is called before recording stops
+            //
+            // NO debounce — a debounce fires mid-utterance and generates
+            // multiple duplicate entries for the same block.
             let pendingText = '';
             let pendingSpeaker = '';
-            let lastCommittedText = '';
-            let debounceTimer: NodeJS.Timeout | null = null;
+            const MAX_UTTERANCE_CHARS = 400;
 
-            const clean = (text: string) =>
-              text.toLowerCase().replace(/[^a-z0-9]/g, '');
+            const clean = (t: string) =>
+              t.toLowerCase().replace(/[^a-z0-9]/g, '');
 
             const sendCommitted = (speaker: string, text: string) => {
               const trimmed = text.trim();
@@ -1754,83 +1649,76 @@ export class GoogleMeetBot extends MeetBotBase {
               );
               if ((window as any).screenAppSendTranscript) {
                 (window as any).screenAppSendTranscript(transcriptData);
-              } else {
-                console.log('TRANSCRIPT_DATA:', JSON.stringify(transcriptData));
               }
-              lastCommittedText = trimmed;
             };
 
             const processCaption = () => {
               try {
                 const result = extractCaption();
 
-                // Case 1: Caption disappeared
+                // Case 1: Caption disappeared → commit pending
                 if (!result || !result.text) {
-                  if (debounceTimer) clearTimeout(debounceTimer);
-                  if (pendingText && pendingText !== lastCommittedText) {
-                    sendCommitted(pendingSpeaker, pendingText);
-                  }
+                  if (pendingText) sendCommitted(pendingSpeaker, pendingText);
                   pendingText = '';
                   pendingSpeaker = '';
-                  lastCommittedText = ''; // Reset so next utterance can start fresh
                   return;
                 }
 
                 const { text, speaker } = result;
-                if (text === pendingText) return; // Exact match, no change
+                const tLower = text.toLowerCase();
 
-                // Check if meaningful change (ignoring punctuation/case)
-                const normPending = clean(pendingText);
-                const normNew = clean(text);
-
-                // Case 2: Continuation/Correction (new text contains old text roughly)
-                // e.g. "Tested. In." -> "Tested. In the beginning."
+                // Noise filter: skip Google Meet policy/abuse/removal notices
                 if (
-                  normNew.startsWith(normPending) ||
-                  normNew.includes(normPending)
+                  tLower.includes('abuse is reported on a call') ||
+                  tLower.includes('google for verification') ||
+                  tLower.includes("you've been removed") ||
+                  tLower.includes('you have been removed') ||
+                  tLower.includes('seconds left') ||
+                  tLower.includes('returning to home screen')
                 ) {
-                  pendingText = text;
-                  pendingSpeaker = speaker;
+                  return;
+                }
 
-                  // Debounce: Wait for 1s of stability before committing
-                  if (debounceTimer) clearTimeout(debounceTimer);
-                  debounceTimer = setTimeout(() => {
-                    if (pendingText && pendingText !== lastCommittedText) {
-                      sendCommitted(pendingSpeaker, pendingText);
-                    }
-                  }, 1000); // 1s stability per utterance
-                } else {
-                  // Case 3: Complete change/Reset (old utterance finished, new one started)
-                  // Commit the old pending text first if valid
-                  if (debounceTimer) clearTimeout(debounceTimer);
-                  if (pendingText && pendingText !== lastCommittedText) {
-                    sendCommitted(pendingSpeaker, pendingText);
-                  }
+                if (text === pendingText) return; // no change
 
-                  // Start new utterance
-                  pendingText = text;
-                  pendingSpeaker = speaker;
-                  // Start debounce for new text
-                  debounceTimer = setTimeout(() => {
-                    if (pendingText && pendingText !== lastCommittedText) {
-                      sendCommitted(pendingSpeaker, pendingText);
-                    }
-                  }, 1000);
+                // Continuation check (normalized — ignores punctuation/case):
+                //   - new text must be at least as long as the old text, AND
+                //   - its normalized form must begin with the old text's prefix
+                // If either fails → the block was reset → commit old utterance.
+                const normOld = clean(pendingText);
+                const normNew = clean(text);
+                const prefixLen = Math.min(normOld.length, 30);
+                const isContinuation =
+                  pendingText.length === 0 ||
+                  (normNew.length >= normOld.length &&
+                    normNew.startsWith(normOld.substring(0, prefixLen)));
+
+                if (!isContinuation) {
+                  // Block reset → commit the completed utterance
+                  if (pendingText) sendCommitted(pendingSpeaker, pendingText);
+                }
+
+                pendingText = text;
+                pendingSpeaker = speaker;
+
+                // Safety flush for very long continuous speech
+                if (pendingText.length > MAX_UTTERANCE_CHARS) {
+                  sendCommitted(pendingSpeaker, pendingText);
+                  pendingText = '';
+                  pendingSpeaker = '';
                 }
               } catch (e) {
-                // Swallow
+                // Swallow — don't let transcript errors kill the recording
               }
             };
 
-            // Flush the last in-flight utterance
+            // Flush the last in-flight utterance (called before recording stops)
             (window as any).__transcriptFlush = () => {
-              if (debounceTimer) clearTimeout(debounceTimer);
-              if (pendingText && pendingText !== lastCommittedText) {
+              if (pendingText) {
                 sendCommitted(pendingSpeaker, pendingText);
+                pendingText = '';
+                pendingSpeaker = '';
               }
-              pendingText = '';
-              pendingSpeaker = '';
-              lastCommittedText = '';
             };
 
             // MutationObserver — fires on DOM changes (immediate)
@@ -1873,11 +1761,6 @@ export class GoogleMeetBot extends MeetBotBase {
         slightlySecretId: this.slightlySecretId,
         activateInactivityDetectionAfterMinutes:
           config.activateInactivityDetectionAfter,
-        audioOnly,
-        activateInactivityDetectionAfter: new Date(
-          new Date().getTime() +
-            config.activateInactivityDetectionAfter * 60 * 1000,
-        ).toISOString(),
         primaryMimeType: webmMimeType,
         secondaryMimeType: vp9MimeType,
       },
