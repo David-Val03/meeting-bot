@@ -14,7 +14,16 @@ export interface StorageProvider {
   readonly name: 's3' | 'azure';
   validateConfig(): void;
   uploadFile(options: UploadOptions): Promise<boolean>;
-  getSignedUrl?(key: string, options?: { expiresInSeconds?: number; contentType?: string }): Promise<string>;
+  uploadBuffer(
+    buffer: Buffer,
+    key: string,
+    contentType: ContentType,
+    logger: Logger,
+  ): Promise<boolean>;
+  getSignedUrl?(
+    key: string,
+    options?: { expiresInSeconds?: number; contentType?: string },
+  ): Promise<string>;
   exists?(key: string): Promise<boolean>;
   delete?(key: string): Promise<void>;
   list?(prefix: string): Promise<string[]>;

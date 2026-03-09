@@ -22,7 +22,7 @@ import {
   GOOGLE_REQUEST_DENIED,
   GOOGLE_REQUEST_TIMEOUT,
 } from '../constants';
-import { vp9MimeType, webmMimeType } from '../lib/recording';
+import { audioWebmMimeType, vp9MimeType, webmMimeType } from '../lib/recording';
 
 export class GoogleMeetBot extends MeetBotBase {
   private _logger: Logger;
@@ -61,7 +61,7 @@ export class GoogleMeetBot extends MeetBotBase {
 
     try {
       const pushState = (st: BotStatus) => _state.push(st);
-      await this.joinMeeting({
+      const images = await this.joinMeeting({
         url,
         name,
         bearerToken,
@@ -74,6 +74,10 @@ export class GoogleMeetBot extends MeetBotBase {
         pushState,
         audioOnly,
       });
+
+      if (images && images.length > 0 && uploader.setImages) {
+        uploader.setImages(images);
+      }
 
       // Finish the upload from the temp video
       const uploadResult = await handleUpload();
@@ -137,7 +141,10 @@ export class GoogleMeetBot extends MeetBotBase {
     botId,
     pushState,
     uploader,
-  }: JoinParams & { pushState(state: BotStatus): void }): Promise<void> {
+    audioOnly,
+  }: JoinParams & { pushState(state: BotStatus): void }): Promise<
+    string[] | void
+  > {
     this._logger.info('Launching browser...');
 
     this.page = await createBrowserContext(url, this._correlationId, 'google');
@@ -763,17 +770,18 @@ export class GoogleMeetBot extends MeetBotBase {
 
     // Recording the meeting page
     this._logger.info('Begin recording...');
-    await this.recordMeetingPage({
+    const images = await this.recordMeetingPage({
       teamId,
       eventId,
       userId,
       botId,
       uploader,
+      audioOnly,
     });
 
     pushState('finished');
 
-    pushState('finished');
+    return images;
   }
 
   private async recordMeetingPage({
@@ -782,15 +790,58 @@ export class GoogleMeetBot extends MeetBotBase {
     eventId,
     botId,
     uploader,
+    audioOnly,
   }: {
     teamId: string;
     userId: string;
     eventId?: string;
     botId?: string;
     uploader: IUploader;
-  }): Promise<void> {
+    audioOnly?: boolean;
+  }): Promise<string[]> {
     const duration = config.maxRecordingDuration * 60 * 1000;
     const inactivityLimit = config.inactivityLimit * 60 * 1000;
+    const processingTime = 0.2 * 60 * 1000;
+
+    const waitingPromise: WaitPromise = getWaitingPromise(
+      processingTime + duration,
+    );
+
+    // --- Start Periodic Screenshot Capture if Audio Only ---
+    let screenshotInterval: NodeJS.Timeout | null = null;
+    const capturedImages: string[] = [];
+
+    if (audioOnly) {
+      this._logger.info('Audio-only mode: Starting periodic screenshots');
+      const intervalMs = 60000; // 60 seconds
+
+      screenshotInterval = setInterval(async () => {
+        try {
+          if (!this.page || this.page.isClosed()) return;
+          this._logger.debug('Capturing screenshot...');
+          const buffer = await this.page.screenshot({
+            type: 'jpeg',
+            quality: 80,
+          });
+          const filename = `screenshot-${botId || Date.now()}-${Date.now()}`;
+
+          const url = await uploadDebugImage(
+            buffer,
+            filename,
+            userId || 'unknown-user',
+            this._logger,
+            botId,
+            { skipTimestamp: false },
+          );
+
+          if (url) {
+            capturedImages.push(url);
+          }
+        } catch (err) {
+          this._logger.error('Failed to capture/upload screenshot:', err);
+        }
+      }, intervalMs);
+    }
 
     // Capture and send the browser console logs to Node.js context
     this.page?.on('console', async (msg) => {
@@ -836,268 +887,306 @@ export class GoogleMeetBot extends MeetBotBase {
     );
 
     // Inject the MediaRecorder code into the browser context using page.evaluate
-    await this.page.evaluate(
-      async ({
-        teamId,
-        duration,
-        inactivityLimit,
-        userId,
-        slightlySecretId,
-        activateInactivityDetectionAfterMinutes,
-        primaryMimeType,
-        secondaryMimeType,
-      }: {
-        teamId: string;
-        userId: string;
-        duration: number;
-        inactivityLimit: number;
-        slightlySecretId: string;
-        activateInactivityDetectionAfterMinutes: number;
-        primaryMimeType: string;
-        secondaryMimeType: string;
-      }) => {
-        let timeoutId: NodeJS.Timeout;
-        let inactivityParticipantDetectionTimeout: NodeJS.Timeout;
-        let inactivitySilenceDetectionTimeout: NodeJS.Timeout;
-        let isOnValidGoogleMeetPageInterval: NodeJS.Timeout;
+    try {
+      await this.page.evaluate(
+        async ({
+          teamId,
+          duration,
+          inactivityLimit,
+          userId,
+          slightlySecretId,
+          activateInactivityDetectionAfterMinutes,
+          primaryMimeType,
+          secondaryMimeType,
+          audioOnly,
+        }: {
+          teamId: string;
+          userId: string;
+          duration: number;
+          inactivityLimit: number;
+          slightlySecretId: string;
+          activateInactivityDetectionAfterMinutes: number;
+          primaryMimeType: string;
+          secondaryMimeType: string;
+          audioOnly?: boolean;
+        }) => {
+          let timeoutId: NodeJS.Timeout;
+          let inactivityParticipantDetectionTimeout: NodeJS.Timeout;
+          let inactivitySilenceDetectionTimeout: NodeJS.Timeout;
+          let isOnValidGoogleMeetPageInterval: NodeJS.Timeout;
 
-        const sendChunkToServer = async (chunk: ArrayBuffer) => {
-          function arrayBufferToBase64(buffer: ArrayBuffer) {
-            let binary = '';
-            const bytes = new Uint8Array(buffer);
-            for (let i = 0; i < bytes.byteLength; i++) {
-              binary += String.fromCharCode(bytes[i]);
+          const sendChunkToServer = async (chunk: ArrayBuffer) => {
+            function arrayBufferToBase64(buffer: ArrayBuffer) {
+              let binary = '';
+              const bytes = new Uint8Array(buffer);
+              for (let i = 0; i < bytes.byteLength; i++) {
+                binary += String.fromCharCode(bytes[i]);
+              }
+              return btoa(binary);
             }
-            return btoa(binary);
-          }
-          const base64 = arrayBufferToBase64(chunk);
-          await (window as any).screenAppSendData(slightlySecretId, base64);
-        };
+            const base64 = arrayBufferToBase64(chunk);
+            await (window as any).screenAppSendData(slightlySecretId, base64);
+          };
 
-        async function startRecording() {
-          console.log('[Bot] Recording started.');
+          async function startRecording() {
+            console.log('[Bot] Recording started.');
 
-          // Check for the availability of the mediaDevices API
-          if (
-            !navigator.mediaDevices ||
-            !navigator.mediaDevices.getDisplayMedia
-          ) {
-            console.error(
-              'MediaDevices or getDisplayMedia not supported in this browser.',
-            );
-            return;
-          }
-
-          const stream: MediaStream = await (
-            navigator.mediaDevices as any
-          ).getDisplayMedia({
-            video: true,
-            audio: {
-              autoGainControl: false,
-              channels: 2,
-              channelCount: 2,
-              echoCancellation: false,
-              noiseSuppression: false,
-            },
-            preferCurrentTab: true,
-          });
-
-          // Check if we actually got audio tracks
-          const audioTracks = stream.getAudioTracks();
-          const hasAudioTracks = audioTracks.length > 0;
-
-          if (!hasAudioTracks) {
-            console.warn(
-              'No audio tracks available for silence detection. Will rely only on presence detection.',
-            );
-          }
-
-          const recordingStream = stream;
-
-          let options: MediaRecorderOptions = {};
-          if (MediaRecorder.isTypeSupported(primaryMimeType)) {
-            options = { mimeType: primaryMimeType };
-          } else {
-            console.warn(
-              `Primary codec ${primaryMimeType} not supported, using fallback ${secondaryMimeType}`,
-            );
-            options = { mimeType: secondaryMimeType };
-          }
-
-          const mediaRecorder = new MediaRecorder(recordingStream, {
-            ...options,
-          });
-
-          mediaRecorder.ondataavailable = async (event: BlobEvent) => {
-            if (!event.data.size) {
-              console.warn('Received empty chunk...');
+            // Check for the availability of the mediaDevices API
+            if (
+              !navigator.mediaDevices ||
+              !navigator.mediaDevices.getDisplayMedia
+            ) {
+              console.error(
+                'MediaDevices or getDisplayMedia not supported in this browser.',
+              );
               return;
             }
-            try {
-              const arrayBuffer = await event.data.arrayBuffer();
-              sendChunkToServer(arrayBuffer);
-            } catch (error) {
-              console.error('Error uploading chunk:', error);
-            }
-          };
 
-          // Start recording with 2-second intervals
-          const chunkDuration = 2000;
-          mediaRecorder.start(chunkDuration);
+            const stream: MediaStream = await (
+              navigator.mediaDevices as any
+            ).getDisplayMedia({
+              // getDisplayMedia requires video to be present, but in audio-only mode we
+              // use the absolute minimum (1×1 px, 1 fps) to satisfy the API while
+              // consuming negligible GPU/CPU — the video track is dropped below.
+              video: audioOnly ? { width: 1, height: 1, frameRate: 1 } : true,
+              audio: {
+                autoGainControl: false,
+                channels: 2,
+                channelCount: 2,
+                echoCancellation: false,
+                noiseSuppression: false,
+              },
+              preferCurrentTab: true,
+            });
 
-          let dismissModalsInterval: NodeJS.Timeout;
-          let lastDimissError: Error | null = null;
+            // Check if we actually got audio tracks
+            const audioTracks = stream.getAudioTracks();
+            const hasAudioTracks = audioTracks.length > 0;
 
-          const stopTheRecording = async () => {
-            mediaRecorder.stop();
-            stream.getTracks().forEach((track) => track.stop());
-
-            // Cleanup recording timer
-            clearTimeout(timeoutId);
-
-            // Cancel the perpetural checks
-            if (inactivityParticipantDetectionTimeout) {
-              clearTimeout(inactivityParticipantDetectionTimeout);
-            }
-            if (inactivitySilenceDetectionTimeout) {
-              clearTimeout(inactivitySilenceDetectionTimeout);
+            if (!hasAudioTracks) {
+              console.warn(
+                'No audio tracks available for silence detection. Will rely only on presence detection.',
+              );
             }
 
-            if (loneTest) {
-              clearTimeout(loneTest);
+            // For audio-only mode, record only audio tracks to avoid storing video data
+            const recordingStream = audioOnly
+              ? new MediaStream(stream.getAudioTracks())
+              : stream;
+
+            let options: MediaRecorderOptions = {};
+            if (MediaRecorder.isTypeSupported(primaryMimeType)) {
+              options = { mimeType: primaryMimeType };
+            } else {
+              console.warn(
+                `Primary codec ${primaryMimeType} not supported, using fallback ${secondaryMimeType}`,
+              );
+              options = { mimeType: secondaryMimeType };
             }
 
-            if (isOnValidGoogleMeetPageInterval) {
-              clearInterval(isOnValidGoogleMeetPageInterval);
-            }
+            const mediaRecorder = new MediaRecorder(recordingStream, {
+              ...options,
+            });
 
-            if (dismissModalsInterval) {
-              clearInterval(dismissModalsInterval);
-              if (lastDimissError && lastDimissError instanceof Error) {
-                console.error('Error dismissing modals:', {
-                  lastDimissError,
-                  message: lastDimissError?.message,
-                });
+            mediaRecorder.ondataavailable = async (event: BlobEvent) => {
+              if (!event.data.size) {
+                console.warn('Received empty chunk...');
+                return;
               }
-            }
+              try {
+                const arrayBuffer = await event.data.arrayBuffer();
+                sendChunkToServer(arrayBuffer);
+              } catch (error) {
+                console.error('Error uploading chunk:', error);
+              }
+            };
 
-            // Flush last in-flight transcript utterance before closing
-            if ((window as any).__transcriptFlush) {
-              (window as any).__transcriptFlush();
-            }
-            // Clear transcript poll interval
-            if ((window as any).__transcriptPollInterval) {
-              clearInterval((window as any).__transcriptPollInterval);
-            }
-            // Begin browser cleanup
-            (window as any).screenAppMeetEnd(slightlySecretId);
-          };
+            // Start recording with 2-second intervals
+            const chunkDuration = 2000;
+            mediaRecorder.start(chunkDuration);
 
-          let loneTest: NodeJS.Timeout;
-          let detectionFailures = 0;
-          let loneTestDetectionActive = true;
-          const maxDetectionFailures = 10; // Track up to 10 consecutive failures
+            let dismissModalsInterval: NodeJS.Timeout;
+            let lastDimissError: Error | null = null;
 
-          function detectLoneParticipantResilient(): void {
-            const re = /^[0-9]+$/;
+            const stopTheRecording = async () => {
+              mediaRecorder.stop();
+              stream.getTracks().forEach((track) => track.stop());
 
-            function getContributorsCount(): number | undefined {
-              function findPeopleButton() {
-                try {
-                  // 1. Try to locate using attribute "starts with"
-                  let btn: Element | null | undefined = document.querySelector(
-                    'button[aria-label^="People -"]',
-                  );
-                  if (btn) return btn;
+              // Cleanup recording timer
+              clearTimeout(timeoutId);
 
-                  // 2. Try to locate using attribute "contains"
-                  btn = document.querySelector('button[aria-label*="People"]');
-                  if (btn) return btn;
+              // Cancel the perpetural checks
+              if (inactivityParticipantDetectionTimeout) {
+                clearTimeout(inactivityParticipantDetectionTimeout);
+              }
+              if (inactivitySilenceDetectionTimeout) {
+                clearTimeout(inactivitySilenceDetectionTimeout);
+              }
 
-                  // 3. Try via aria-labelledby pointing to element with "People" text
-                  const allBtns = Array.from(
-                    document.querySelectorAll('button[aria-labelledby]'),
-                  );
-                  btn = allBtns.find((b) => {
-                    const labelledBy = b.getAttribute('aria-labelledby');
-                    if (labelledBy) {
-                      const labelElement = document.getElementById(labelledBy);
-                      if (
-                        labelElement &&
-                        labelElement.textContent?.trim() === 'People'
-                      ) {
-                        return true;
-                      }
-                    }
-                    return false;
+              if (loneTest) {
+                clearTimeout(loneTest);
+              }
+
+              if (isOnValidGoogleMeetPageInterval) {
+                clearInterval(isOnValidGoogleMeetPageInterval);
+              }
+
+              if (dismissModalsInterval) {
+                clearInterval(dismissModalsInterval);
+                if (lastDimissError && lastDimissError instanceof Error) {
+                  console.error('Error dismissing modals:', {
+                    lastDimissError,
+                    message: lastDimissError?.message,
                   });
-                  if (btn) return btn;
-
-                  // 4. Try via regex on aria-label (for more complex patterns)
-                  const allBtnsWithLabel = Array.from(
-                    document.querySelectorAll('button[aria-label]'),
-                  );
-                  btn = allBtnsWithLabel.find((b) => {
-                    const label = b.getAttribute('aria-label');
-                    return label && /^People - \d+ joined$/.test(label);
-                  });
-                  if (btn) return btn;
-
-                  // 5. Fallback: Look for button with a child icon containing "people"
-                  btn = allBtnsWithLabel.find((b) =>
-                    Array.from(b.querySelectorAll('i')).some(
-                      (i) => i.textContent && i.textContent.trim() === 'people',
-                    ),
-                  );
-                  if (btn) return btn;
-
-                  // 6. Not found
-                  return null;
-                } catch (error) {
-                  console.log('Error finding people button:', error);
-                  return null;
                 }
               }
 
-              // Find participant count badge near People button (doesn't require opening panel)
-              try {
-                const peopleBtn = findPeopleButton();
-                // console.log('[Detection] People button found:', !!peopleBtn);
+              // Flush last in-flight transcript utterance before closing
+              if ((window as any).__transcriptFlush) {
+                (window as any).__transcriptFlush();
+              }
+              // Clear transcript poll interval
+              if ((window as any).__transcriptPollInterval) {
+                clearInterval((window as any).__transcriptPollInterval);
+              }
+              // Begin browser cleanup
+              (window as any).screenAppMeetEnd(slightlySecretId);
+            };
 
-                if (peopleBtn) {
-                  // Search INSIDE the button (descendants) and nearby (parent container)
-                  const searchRoots = [
-                    peopleBtn, // Search inside button itself
-                    peopleBtn.parentElement,
-                    peopleBtn.parentElement?.parentElement,
-                  ].filter(Boolean);
+            let loneTest: NodeJS.Timeout;
+            let detectionFailures = 0;
+            let loneTestDetectionActive = true;
+            const maxDetectionFailures = 10; // Track up to 10 consecutive failures
 
-                  // console.log('[Detection] Searching', searchRoots.length, 'containers');
+            function detectLoneParticipantResilient(): void {
+              const re = /^[0-9]+$/;
 
-                  for (const searchRoot of searchRoots) {
-                    if (!searchRoot) continue;
+              function getContributorsCount(): number | undefined {
+                function findPeopleButton() {
+                  try {
+                    // 1. Try to locate using attribute "starts with"
+                    let btn: Element | null | undefined =
+                      document.querySelector('button[aria-label^="People -"]');
+                    if (btn) return btn;
 
-                    // Method 1: Look for data-avatar-count attribute (most reliable)
-                    const avatarSpan = searchRoot.querySelector(
-                      '[data-avatar-count]',
+                    // 2. Try to locate using attribute "contains"
+                    btn = document.querySelector(
+                      'button[aria-label*="People"]',
                     );
-                    if (avatarSpan) {
-                      const countAttr =
-                        avatarSpan.getAttribute('data-avatar-count');
-                      // console.log('[Detection] Method 1 SUCCESS - data-avatar-count:', countAttr);
-                      const count = Number(countAttr);
-                      if (!isNaN(count) && count > 0) {
-                        return count;
+                    if (btn) return btn;
+
+                    // 3. Try via aria-labelledby pointing to element with "People" text
+                    const allBtns = Array.from(
+                      document.querySelectorAll('button[aria-labelledby]'),
+                    );
+                    btn = allBtns.find((b) => {
+                      const labelledBy = b.getAttribute('aria-labelledby');
+                      if (labelledBy) {
+                        const labelElement =
+                          document.getElementById(labelledBy);
+                        if (
+                          labelElement &&
+                          labelElement.textContent?.trim() === 'People'
+                        ) {
+                          return true;
+                        }
+                      }
+                      return false;
+                    });
+                    if (btn) return btn;
+
+                    // 4. Try via regex on aria-label (for more complex patterns)
+                    const allBtnsWithLabel = Array.from(
+                      document.querySelectorAll('button[aria-label]'),
+                    );
+                    btn = allBtnsWithLabel.find((b) => {
+                      const label = b.getAttribute('aria-label');
+                      return label && /^People - \d+ joined$/.test(label);
+                    });
+                    if (btn) return btn;
+
+                    // 5. Fallback: Look for button with a child icon containing "people"
+                    btn = allBtnsWithLabel.find((b) =>
+                      Array.from(b.querySelectorAll('i')).some(
+                        (i) =>
+                          i.textContent && i.textContent.trim() === 'people',
+                      ),
+                    );
+                    if (btn) return btn;
+
+                    // 6. Not found
+                    return null;
+                  } catch (error) {
+                    console.log('Error finding people button:', error);
+                    return null;
+                  }
+                }
+
+                // Find participant count badge near People button (doesn't require opening panel)
+                try {
+                  const peopleBtn = findPeopleButton();
+                  // console.log('[Detection] People button found:', !!peopleBtn);
+
+                  if (peopleBtn) {
+                    // Search INSIDE the button (descendants) and nearby (parent container)
+                    const searchRoots = [
+                      peopleBtn, // Search inside button itself
+                      peopleBtn.parentElement,
+                      peopleBtn.parentElement?.parentElement,
+                    ].filter(Boolean);
+
+                    // console.log('[Detection] Searching', searchRoots.length, 'containers');
+
+                    for (const searchRoot of searchRoots) {
+                      if (!searchRoot) continue;
+
+                      // Method 1: Look for data-avatar-count attribute (most reliable)
+                      const avatarSpan = searchRoot.querySelector(
+                        '[data-avatar-count]',
+                      );
+                      if (avatarSpan) {
+                        const countAttr =
+                          avatarSpan.getAttribute('data-avatar-count');
+                        // console.log('[Detection] Method 1 SUCCESS - data-avatar-count:', countAttr);
+                        const count = Number(countAttr);
+                        if (!isNaN(count) && count > 0) {
+                          return count;
+                        }
+                      }
+
+                      // Method 2: Fallback - Look for number in badge div
+                      const badgeDiv = searchRoot.querySelector(
+                        'div.egzc7c',
+                      ) as HTMLElement;
+                      if (badgeDiv) {
+                        const text = (
+                          (badgeDiv.innerText || badgeDiv.textContent) ??
+                          ''
+                        ).trim();
+                        if (
+                          text.length > 0 &&
+                          text.length <= 3 &&
+                          re.test(text)
+                        ) {
+                          const count = Number(text);
+                          if (!isNaN(count) && count > 0) {
+                            // console.log('[Detection] Method 2 SUCCESS - Badge text:', text);
+                            return count;
+                          }
+                        }
                       }
                     }
 
-                    // Method 2: Fallback - Look for number in badge div
-                    const badgeDiv = searchRoot.querySelector(
-                      'div.egzc7c',
-                    ) as HTMLElement;
-                    if (badgeDiv) {
+                    // Method 3: Last resort - search for short numbers in People button area
+                    const mainSearchRoot =
+                      peopleBtn.parentElement?.parentElement || peopleBtn;
+                    const allDivs = Array.from(
+                      mainSearchRoot.querySelectorAll('div'),
+                    );
+                    for (const div of allDivs) {
                       const text = (
-                        (badgeDiv.innerText || badgeDiv.textContent) ??
+                        (div as HTMLElement).innerText ||
+                        div.textContent ||
                         ''
                       ).trim();
                       if (
@@ -1105,685 +1194,690 @@ export class GoogleMeetBot extends MeetBotBase {
                         text.length <= 3 &&
                         re.test(text)
                       ) {
-                        const count = Number(text);
-                        if (!isNaN(count) && count > 0) {
-                          // console.log('[Detection] Method 2 SUCCESS - Badge text:', text);
-                          return count;
+                        const isVisible =
+                          (div as HTMLElement).offsetParent !== null;
+                        if (isVisible) {
+                          const count = Number(text);
+                          if (!isNaN(count) && count > 0) {
+                            // console.log('[Detection] Method 3 SUCCESS - Found number:', count);
+                            return count;
+                          }
                         }
                       }
                     }
+                    // console.log('[Detection] All methods failed to find count');
+                  } else {
+                    // console.log('[Detection] People button NOT found');
                   }
-
-                  // Method 3: Last resort - search for short numbers in People button area
-                  const mainSearchRoot =
-                    peopleBtn.parentElement?.parentElement || peopleBtn;
-                  const allDivs = Array.from(
-                    mainSearchRoot.querySelectorAll('div'),
-                  );
-                  for (const div of allDivs) {
-                    const text = (
-                      (div as HTMLElement).innerText ||
-                      div.textContent ||
-                      ''
-                    ).trim();
-                    if (text.length > 0 && text.length <= 3 && re.test(text)) {
-                      const isVisible =
-                        (div as HTMLElement).offsetParent !== null;
-                      if (isVisible) {
-                        const count = Number(text);
-                        if (!isNaN(count) && count > 0) {
-                          // console.log('[Detection] Method 3 SUCCESS - Found number:', count);
-                          return count;
-                        }
-                      }
-                    }
-                  }
-                  // console.log('[Detection] All methods failed to find count');
-                } else {
-                  // console.log('[Detection] People button NOT found');
+                } catch (error) {
+                  console.log('Error finding participant badge:', error);
                 }
-              } catch (error) {
-                console.log('Error finding participant badge:', error);
+
+                return undefined;
               }
 
-              return undefined;
-            }
-
-            function retryWithBackoff(): void {
-              loneTest = setTimeout(function check() {
-                if (!loneTestDetectionActive) {
-                  if (loneTest) {
-                    clearTimeout(loneTest);
-                  }
-                  return;
-                }
-                let contributors: number | undefined;
-                try {
-                  contributors = getContributorsCount();
-
-                  // Log participant count once per minute
-
-                  if (typeof contributors === 'undefined') {
-                    detectionFailures++;
-                    console.warn(
-                      'Meet participant detection failed, retrying. Failure count:',
-                      detectionFailures,
-                    );
-                    if (detectionFailures >= maxDetectionFailures) {
-                      loneTestDetectionActive = false;
+              function retryWithBackoff(): void {
+                loneTest = setTimeout(function check() {
+                  if (!loneTestDetectionActive) {
+                    if (loneTest) {
+                      clearTimeout(loneTest);
                     }
+                    return;
+                  }
+                  let contributors: number | undefined;
+                  try {
+                    contributors = getContributorsCount();
+
+                    // Log participant count once per minute
+
+                    if (typeof contributors === 'undefined') {
+                      detectionFailures++;
+                      console.warn(
+                        'Meet participant detection failed, retrying. Failure count:',
+                        detectionFailures,
+                      );
+                      if (detectionFailures >= maxDetectionFailures) {
+                        loneTestDetectionActive = false;
+                      }
+                      retryWithBackoff();
+                      return;
+                    }
+                    detectionFailures = 0;
+                    if (contributors < 2) {
+                      console.log('Bot is alone, ending meeting.');
+                      loneTestDetectionActive = false;
+                      stopTheRecording();
+                      return;
+                    }
+                  } catch (err) {
+                    detectionFailures++;
+                    console.error('Detection error:', err, detectionFailures);
                     retryWithBackoff();
                     return;
                   }
-                  detectionFailures = 0;
-                  if (contributors < 2) {
-                    console.log('Bot is alone, ending meeting.');
-                    loneTestDetectionActive = false;
-                    stopTheRecording();
-                    return;
-                  }
-                } catch (err) {
-                  detectionFailures++;
-                  console.error('Detection error:', err, detectionFailures);
                   retryWithBackoff();
-                  return;
-                }
-                retryWithBackoff();
-              }, 5000);
+                }, 5000);
+              }
+
+              retryWithBackoff();
             }
 
-            retryWithBackoff();
-          }
+            const detectIncrediblySilentMeeting = () => {
+              // Only run silence detection if we have audio tracks
+              if (!hasAudioTracks) {
+                console.warn(
+                  'Skipping silence detection - no audio tracks available. This may be due to browser permissions or Google Meet audio sharing settings.',
+                );
+                console.warn(
+                  'Meeting will rely on presence detection and max duration timeout.',
+                );
+                return;
+              }
 
-          const detectIncrediblySilentMeeting = () => {
-            // Only run silence detection if we have audio tracks
-            if (!hasAudioTracks) {
-              console.warn(
-                'Skipping silence detection - no audio tracks available. This may be due to browser permissions or Google Meet audio sharing settings.',
-              );
-              console.warn(
-                'Meeting will rely on presence detection and max duration timeout.',
-              );
-              return;
-            }
+              try {
+                const audioContext = new AudioContext();
+                const mediaSource =
+                  audioContext.createMediaStreamSource(stream);
+                const analyser = audioContext.createAnalyser();
 
-            try {
-              const audioContext = new AudioContext();
-              const mediaSource = audioContext.createMediaStreamSource(stream);
-              const analyser = audioContext.createAnalyser();
-
-              /* Use a value suitable for the given use case of silence detection
+                /* Use a value suitable for the given use case of silence detection
                  |
                  |____ Relatively smaller FFT size for faster processing and less sampling
               */
-              analyser.fftSize = 256;
+                analyser.fftSize = 256;
 
-              mediaSource.connect(analyser);
+                mediaSource.connect(analyser);
 
-              const dataArray = new Uint8Array(analyser.frequencyBinCount);
+                const dataArray = new Uint8Array(analyser.frequencyBinCount);
 
-              // Sliding silence period
-              let silenceDuration = 0;
-              let totalChecks = 0;
-              let audioActivitySum = 0;
+                // Sliding silence period
+                let silenceDuration = 0;
+                let totalChecks = 0;
+                let audioActivitySum = 0;
 
-              // Audio gain/volume
-              const silenceThreshold = 10;
+                // Audio gain/volume
+                const silenceThreshold = 10;
 
-              let monitor = true;
+                let monitor = true;
 
-              const monitorSilence = () => {
-                try {
-                  analyser.getByteFrequencyData(dataArray);
+                const monitorSilence = () => {
+                  try {
+                    analyser.getByteFrequencyData(dataArray);
 
-                  const audioActivity =
-                    dataArray.reduce((a, b) => a + b) / dataArray.length;
-                  audioActivitySum += audioActivity;
-                  totalChecks++;
+                    const audioActivity =
+                      dataArray.reduce((a, b) => a + b) / dataArray.length;
+                    audioActivitySum += audioActivity;
+                    totalChecks++;
 
-                  if (audioActivity < silenceThreshold) {
-                    silenceDuration += 100; // Check every 100ms
-                    if (silenceDuration >= inactivityLimit) {
-                      console.warn(
-                        'Detected silence in Google Meet and ending the recording on team:',
-                        userId,
-                        teamId,
-                      );
-                      console.log(
-                        'Silence detection stats - Avg audio activity:',
-                        (audioActivitySum / totalChecks).toFixed(2),
-                        'Checks performed:',
-                        totalChecks,
-                      );
-                      monitor = false;
-                      stopTheRecording();
+                    if (audioActivity < silenceThreshold) {
+                      silenceDuration += 100; // Check every 100ms
+                      if (silenceDuration >= inactivityLimit) {
+                        console.warn(
+                          'Detected silence in Google Meet and ending the recording on team:',
+                          userId,
+                          teamId,
+                        );
+                        console.log(
+                          'Silence detection stats - Avg audio activity:',
+                          (audioActivitySum / totalChecks).toFixed(2),
+                          'Checks performed:',
+                          totalChecks,
+                        );
+                        monitor = false;
+                        stopTheRecording();
+                      }
+                    } else {
+                      silenceDuration = 0;
                     }
-                  } else {
-                    silenceDuration = 0;
-                  }
 
-                  if (monitor) {
-                    // Recursively queue the next check
-                    setTimeout(monitorSilence, 100);
-                  }
-                } catch (error) {
-                  console.error('Error in silence monitoring:', error);
-                  console.warn(
-                    'Silence detection failed - will rely on presence detection and max duration timeout.',
-                  );
-                  // Stop monitoring on error
-                  monitor = false;
-                }
-              };
-
-              // Go silence monitor
-              monitorSilence();
-            } catch (error) {
-              console.error('Failed to initialize silence detection:', error);
-              console.warn(
-                'Silence detection initialization failed - will rely on presence detection and max duration timeout.',
-              );
-            }
-          };
-
-          /**
-           * Perpetual checks for inactivity detection
-           */
-          inactivityParticipantDetectionTimeout = setTimeout(
-            () => {
-              detectLoneParticipantResilient();
-            },
-            activateInactivityDetectionAfterMinutes * 60 * 1000,
-          );
-
-          inactivitySilenceDetectionTimeout = setTimeout(
-            () => {
-              detectIncrediblySilentMeeting();
-            },
-            activateInactivityDetectionAfterMinutes * 60 * 1000,
-          );
-
-          const detectModalsAndDismiss = () => {
-            let dismissModalErrorCount = 0;
-            const maxDismissModalErrorCount = 10;
-            dismissModalsInterval = setInterval(() => {
-              try {
-                const buttons = document.querySelectorAll('button');
-                const dismissButtons = Array.from(buttons).filter(
-                  (button) =>
-                    button?.offsetParent !== null &&
-                    button?.innerText?.includes('Got it'),
-                );
-                if (dismissButtons.length > 0) {
-                  dismissButtons[0].click();
-                }
-
-                // Dismiss "Microphone not found" and "Camera not found" notifications
-                const bodyText = document.body.innerText;
-                if (
-                  bodyText.includes('Microphone not found') ||
-                  bodyText.includes(
-                    'Make sure your microphone is plugged in',
-                  ) ||
-                  bodyText.includes('Camera not found') ||
-                  bodyText.includes('Make sure your camera is plugged in')
-                ) {
-                  // Look for close button (X) near the notification
-                  const allButtons = Array.from(
-                    document.querySelectorAll('button'),
-                  );
-                  const closeButtons = allButtons.filter((btn) => {
-                    const ariaLabel = btn.getAttribute('aria-label');
-                    const hasCloseIcon = btn.querySelector('svg') !== null;
-                    // Look for close/dismiss buttons
-                    return (
-                      ariaLabel?.toLowerCase().includes('close') ||
-                      ariaLabel?.toLowerCase().includes('dismiss') ||
-                      (hasCloseIcon &&
-                        btn?.offsetParent !== null &&
-                        btn.innerText === '')
+                    if (monitor) {
+                      // Recursively queue the next check
+                      setTimeout(monitorSilence, 100);
+                    }
+                  } catch (error) {
+                    console.error('Error in silence monitoring:', error);
+                    console.warn(
+                      'Silence detection failed - will rely on presence detection and max duration timeout.',
                     );
-                  });
+                    // Stop monitoring on error
+                    monitor = false;
+                  }
+                };
 
-                  // Click all visible close buttons to dismiss all notifications
-                  closeButtons.forEach((btn) => {
-                    if (btn?.offsetParent !== null) btn.click();
-                  });
-                }
-
-                // Dismiss the Google Meet "You are now presenting" bar.
-                // This appears because getDisplayMedia(preferCurrentTab:true) tells Chrome to
-                // signal tab capture to Google Meet, making the bot appear as a presenter.
-                // We immediately click "Stop presenting" to cancel the presentation.
-                const stopPresentingBtn = Array.from(
-                  document.querySelectorAll('button'),
-                ).find(
-                  (btn) =>
-                    btn?.offsetParent !== null &&
-                    (btn
-                      .getAttribute('aria-label')
-                      ?.toLowerCase()
-                      .includes('stop presenting') ||
-                      btn
-                        .getAttribute('aria-label')
-                        ?.toLowerCase()
-                        .includes('stop sharing') ||
-                      btn.innerText
-                        ?.toLowerCase()
-                        .includes('stop presenting') ||
-                      btn.innerText?.toLowerCase().includes('stop sharing')),
+                // Go silence monitor
+                monitorSilence();
+              } catch (error) {
+                console.error('Failed to initialize silence detection:', error);
+                console.warn(
+                  'Silence detection initialization failed - will rely on presence detection and max duration timeout.',
                 );
-                if (stopPresentingBtn) {
-                  console.log(
-                    '[BotRecorder] Dismissing "You are presenting" bar — stopping accidental screen share...',
-                  );
-                  (stopPresentingBtn as HTMLElement).click();
-                }
-              } catch (error) {
-                lastDimissError = error;
-                dismissModalErrorCount += 1;
-                if (dismissModalErrorCount > maxDismissModalErrorCount) {
-                  console.error(
-                    `Failed to detect and dismiss "Got it" modals ${maxDismissModalErrorCount} times, will stop trying...`,
-                  );
-                  clearInterval(dismissModalsInterval);
-                }
-              }
-            }, 2000);
-          };
-
-          const detectMeetingIsOnAValidPage = () => {
-            // Simple check to verify we're still on a supported Google Meet page
-            const isOnValidGoogleMeetPage = () => {
-              try {
-                // Check if we're still on a Google Meet URL
-                const currentUrl = window.location.href;
-                if (!currentUrl.includes('meet.google.com')) {
-                  console.warn(
-                    'No longer on Google Meet page - URL changed to:',
-                    currentUrl,
-                  );
-                  return false;
-                }
-
-                const currentBodyText = document.body.innerText;
-                if (
-                  currentBodyText.includes(
-                    "You've been removed from the meeting",
-                  )
-                ) {
-                  console.warn(
-                    'Bot was removed from the meeting - ending recording on team:',
-                    userId,
-                    teamId,
-                  );
-                  return false;
-                }
-
-                if (
-                  currentBodyText.includes(
-                    'No one responded to your request to join the call',
-                  )
-                ) {
-                  console.warn(
-                    'Bot was not admitted to the meeting - ending recording on team:',
-                    userId,
-                    teamId,
-                  );
-                  return false;
-                }
-
-                // Check for basic Google Meet UI elements.
-                // NOTE: During screen share Google hides the bottom toolbar briefly,
-                // so we check multiple selectors to avoid a false-positive "left meeting".
-                const hasMeetElements =
-                  document.querySelector('button[aria-label="People"]') !==
-                    null ||
-                  document.querySelector('button[aria-label="Leave call"]') !==
-                    null ||
-                  // Shown during presentation mode when someone shares screen
-                  document.querySelector(
-                    'button[aria-label="Stop presenting"]',
-                  ) !== null ||
-                  document.querySelector(
-                    'button[aria-label="End presentation"]',
-                  ) !== null ||
-                  // Persistent toolbar icons visible in all Meet states
-                  document.querySelector(
-                    'button[aria-label="Chat with everyone"]',
-                  ) !== null ||
-                  document.querySelector('[data-meeting-ended="false"]') !==
-                    null;
-
-                if (!hasMeetElements) {
-                  console.warn(
-                    'Google Meet UI elements not found - page may have changed state',
-                  );
-                  return false;
-                }
-
-                return true;
-              } catch (error) {
-                console.error('Error checking page validity:', error);
-                return false;
               }
             };
-
-            // check if we're still on a valid Google Meet page
-            isOnValidGoogleMeetPageInterval = setInterval(() => {
-              if (!isOnValidGoogleMeetPage()) {
-                console.log(
-                  'Google Meet page state changed - ending recording on team:',
-                  userId,
-                  teamId,
-                );
-                clearInterval(isOnValidGoogleMeetPageInterval);
-                stopTheRecording();
-              }
-            }, 10000);
-          };
-
-          detectModalsAndDismiss();
-
-          detectMeetingIsOnAValidPage();
-
-          // Transcript Scraping Logic
-          // Uses multiple strategies since Google Meet class names change frequently.
-          const startTranscriptScraping = () => {
-            console.log('Starting transcript scraping (multi-strategy)...');
 
             /**
-             * Core function: try every known strategy to extract the current
-             * caption text + speaker name visible on screen.
+             * Perpetual checks for inactivity detection
              */
-            const extractCaption = (): {
-              speaker: string;
-              text: string;
-            } | null => {
-              // ── Strategy 1: Google Meet captions container (confirmed from real DOM) ──
-              // The outer container is div[aria-label="Captions"] — this ARIA attribute
-              // is stable. Inside each caption entry (.nMcdL > .bj4p3b):
-              //   speaker:  span.NWpY1d  (or div.KcIKyf span)
-              //   text:     div.ygicle   (or div.VbkSUe as a fallback class)
-              const captionsRoot = document.querySelector(
-                'div[aria-label="Captions"]',
-              );
-              if (captionsRoot) {
-                // Each caption entry is a .nMcdL block inside the root
-                const entries =
-                  captionsRoot.querySelectorAll('.nMcdL, .bj4p3b');
-                // Iterate backwards to read the newest, actively growing caption block
-                for (const entry of Array.from(entries).reverse()) {
-                  const textEl = entry.querySelector(
-                    'div.ygicle, div.VbkSUe, div.iTTPOb',
-                  ) as HTMLElement | null;
-                  const speakerEl = entry.querySelector(
-                    'span.NWpY1d, div.KcIKyf span, div.adE6rb span',
-                  ) as HTMLElement | null;
-                  const text = textEl?.innerText?.trim() ?? '';
-                  const speaker = speakerEl?.innerText?.trim() ?? '';
-                  if (text) {
-                    return { speaker, text };
+            inactivityParticipantDetectionTimeout = setTimeout(
+              () => {
+                detectLoneParticipantResilient();
+              },
+              activateInactivityDetectionAfterMinutes * 60 * 1000,
+            );
+
+            inactivitySilenceDetectionTimeout = setTimeout(
+              () => {
+                detectIncrediblySilentMeeting();
+              },
+              activateInactivityDetectionAfterMinutes * 60 * 1000,
+            );
+
+            const detectModalsAndDismiss = () => {
+              let dismissModalErrorCount = 0;
+              const maxDismissModalErrorCount = 10;
+              dismissModalsInterval = setInterval(() => {
+                try {
+                  const buttons = document.querySelectorAll('button');
+                  const dismissButtons = Array.from(buttons).filter(
+                    (button) =>
+                      button?.offsetParent !== null &&
+                      button?.innerText?.includes('Got it'),
+                  );
+                  if (dismissButtons.length > 0) {
+                    dismissButtons[0].click();
                   }
-                }
-              }
 
-              // ── Strategy 2: aria-live / role="status" regions ──
-              // NOTE: only fire when the caption container (S1) has text; aria-live
-              // regions in Google Meet also emit UI *notifications* ("has left the
-              // meeting", connectivity warnings, etc.) which must be filtered out.
-              const UI_NOTIFICATION_PATTERNS = [
-                'has left the meeting',
-                'has joined the meeting',
-                'is in the waiting room',
-                'no one else is in this meeting',
-                'your internet connection',
-                'internet connection is unstable',
-                'is having connection issues',
-                'is now presenting',
-                'stopped presenting',
-                'jump to bottom',
-                'you are muted',
-                'unmute yourself',
-                'meeting code',
-                'get help here',
-                'go to the more options',
-                'has been admitted',
-                "you've been removed",
-                'you have been removed',
-                'seconds left',
-                'returning to home screen',
-              ];
-              const ariaRegions = document.querySelectorAll(
-                '[aria-live="polite"], [aria-live="assertive"], [role="status"]',
-              );
-              for (const region of Array.from(ariaRegions)) {
-                const text = (region as HTMLElement).innerText?.trim() ?? '';
-                if (!text || text.length >= 500 || text.length <= 2) continue;
-                const tLower = text.toLowerCase();
-                const isNotification = UI_NOTIFICATION_PATTERNS.some((p) =>
-                  tLower.includes(p),
-                );
-                if (!isNotification) {
-                  return { speaker: '', text };
-                }
-              }
-
-              // ── Strategy 3: position-based bottom 35% of viewport ──
-              const vh = window.innerHeight;
-              const captionZoneTop = vh * 0.65;
-              const allDivs = Array.from(
-                document.querySelectorAll('div, span'),
-              );
-
-              const candidateTexts: string[] = [];
-              for (const el of allDivs) {
-                const rect = el.getBoundingClientRect();
-                if (
-                  rect.top >= captionZoneTop &&
-                  rect.bottom <= vh + 10 &&
-                  rect.width > 100
-                ) {
-                  const elHtml = el as HTMLElement;
-                  // Skip buttons and labelled controls (UI chrome)
+                  // Dismiss "Microphone not found" and "Camera not found" notifications
+                  const bodyText = document.body.innerText;
                   if (
-                    elHtml.tagName === 'BUTTON' ||
-                    elHtml.getAttribute('role') === 'button' ||
-                    elHtml.hasAttribute('aria-label')
-                  )
-                    continue;
-                  const ownText = Array.from(el.childNodes)
-                    .filter((n) => n.nodeType === Node.TEXT_NODE)
-                    .map((n) => n.textContent?.trim())
-                    .join(' ')
-                    .trim();
-                  // Require at least 20 chars — filters out meeting codes / nav labels
-                  if (ownText && ownText.length >= 20 && ownText.length < 300) {
-                    candidateTexts.push(ownText);
-                  } else if (
-                    elHtml.innerText &&
-                    elHtml.children.length === 0 &&
-                    elHtml.innerText.length >= 20 &&
-                    elHtml.innerText.length < 300
+                    bodyText.includes('Microphone not found') ||
+                    bodyText.includes(
+                      'Make sure your microphone is plugged in',
+                    ) ||
+                    bodyText.includes('Camera not found') ||
+                    bodyText.includes('Make sure your camera is plugged in')
                   ) {
-                    candidateTexts.push(elHtml.innerText.trim());
+                    // Look for close button (X) near the notification
+                    const allButtons = Array.from(
+                      document.querySelectorAll('button'),
+                    );
+                    const closeButtons = allButtons.filter((btn) => {
+                      const ariaLabel = btn.getAttribute('aria-label');
+                      const hasCloseIcon = btn.querySelector('svg') !== null;
+                      // Look for close/dismiss buttons
+                      return (
+                        ariaLabel?.toLowerCase().includes('close') ||
+                        ariaLabel?.toLowerCase().includes('dismiss') ||
+                        (hasCloseIcon &&
+                          btn?.offsetParent !== null &&
+                          btn.innerText === '')
+                      );
+                    });
+
+                    // Click all visible close buttons to dismiss all notifications
+                    closeButtons.forEach((btn) => {
+                      if (btn?.offsetParent !== null) btn.click();
+                    });
+                  }
+
+                  // Dismiss the Google Meet "You are now presenting" bar.
+                  // This appears because getDisplayMedia(preferCurrentTab:true) tells Chrome to
+                  // signal tab capture to Google Meet, making the bot appear as a presenter.
+                  // We immediately click "Stop presenting" to cancel the presentation.
+                  const stopPresentingBtn = Array.from(
+                    document.querySelectorAll('button'),
+                  ).find(
+                    (btn) =>
+                      btn?.offsetParent !== null &&
+                      (btn
+                        .getAttribute('aria-label')
+                        ?.toLowerCase()
+                        .includes('stop presenting') ||
+                        btn
+                          .getAttribute('aria-label')
+                          ?.toLowerCase()
+                          .includes('stop sharing') ||
+                        btn.innerText
+                          ?.toLowerCase()
+                          .includes('stop presenting') ||
+                        btn.innerText?.toLowerCase().includes('stop sharing')),
+                  );
+                  if (stopPresentingBtn) {
+                    console.log(
+                      '[BotRecorder] Dismissing "You are presenting" bar — stopping accidental screen share...',
+                    );
+                    (stopPresentingBtn as HTMLElement).click();
+                  }
+                } catch (error) {
+                  lastDimissError = error;
+                  dismissModalErrorCount += 1;
+                  if (dismissModalErrorCount > maxDismissModalErrorCount) {
+                    console.error(
+                      `Failed to detect and dismiss "Got it" modals ${maxDismissModalErrorCount} times, will stop trying...`,
+                    );
+                    clearInterval(dismissModalsInterval);
                   }
                 }
-              }
-              if (candidateTexts.length > 0) {
-                return { speaker: '', text: candidateTexts.join(' ') };
-              }
-              return null;
+              }, 2000);
             };
 
-            // ── Transcript buffering: commit-on-block-reset ──────────────────────
-            // Strategy: Google Meet keeps ONE growing caption block. Words are
-            // appended live (~300ms apart). The block RESETS (clears & starts
-            // fresh) when the speaker pauses or a sentence ends naturally.
-            // We buffer the growing text and only commit when:
-            //   1. The caption disappears (block cleared)
-            //   2. The new text is shorter / diverges from the old text (reset)
-            //   3. The utterance exceeds MAX_UTTERANCE_CHARS (very long speech)
-            //   4. __transcriptFlush() is called before recording stops
-            //
-            // NO debounce — a debounce fires mid-utterance and generates
-            // multiple duplicate entries for the same block.
-            let pendingText = '';
-            let pendingSpeaker = '';
-            const MAX_UTTERANCE_CHARS = 400;
+            const detectMeetingIsOnAValidPage = () => {
+              // Simple check to verify we're still on a supported Google Meet page
+              const isOnValidGoogleMeetPage = () => {
+                try {
+                  // Check if we're still on a Google Meet URL
+                  const currentUrl = window.location.href;
+                  if (!currentUrl.includes('meet.google.com')) {
+                    console.warn(
+                      'No longer on Google Meet page - URL changed to:',
+                      currentUrl,
+                    );
+                    return false;
+                  }
 
-            const clean = (t: string) =>
-              t.toLowerCase().replace(/[^a-z0-9]/g, '');
+                  const currentBodyText = document.body.innerText;
+                  if (
+                    currentBodyText.includes(
+                      "You've been removed from the meeting",
+                    )
+                  ) {
+                    console.warn(
+                      'Bot was removed from the meeting - ending recording on team:',
+                      userId,
+                      teamId,
+                    );
+                    return false;
+                  }
 
-            const sendCommitted = (speaker: string, text: string) => {
-              const trimmed = text.trim();
-              if (!trimmed) return;
-              const transcriptData = {
-                type: 'transcript',
-                timestamp: new Date().toISOString(),
-                speaker: speaker || 'Unknown Speaker',
-                text: trimmed,
+                  if (
+                    currentBodyText.includes(
+                      'No one responded to your request to join the call',
+                    )
+                  ) {
+                    console.warn(
+                      'Bot was not admitted to the meeting - ending recording on team:',
+                      userId,
+                      teamId,
+                    );
+                    return false;
+                  }
+
+                  // Check for basic Google Meet UI elements.
+                  // NOTE: During screen share Google hides the bottom toolbar briefly,
+                  // so we check multiple selectors to avoid a false-positive "left meeting".
+                  const hasMeetElements =
+                    document.querySelector('button[aria-label="People"]') !==
+                      null ||
+                    document.querySelector(
+                      'button[aria-label="Leave call"]',
+                    ) !== null ||
+                    // Shown during presentation mode when someone shares screen
+                    document.querySelector(
+                      'button[aria-label="Stop presenting"]',
+                    ) !== null ||
+                    document.querySelector(
+                      'button[aria-label="End presentation"]',
+                    ) !== null ||
+                    // Persistent toolbar icons visible in all Meet states
+                    document.querySelector(
+                      'button[aria-label="Chat with everyone"]',
+                    ) !== null ||
+                    document.querySelector('[data-meeting-ended="false"]') !==
+                      null;
+
+                  if (!hasMeetElements) {
+                    console.warn(
+                      'Google Meet UI elements not found - page may have changed state',
+                    );
+                    return false;
+                  }
+
+                  return true;
+                } catch (error) {
+                  console.error('Error checking page validity:', error);
+                  return false;
+                }
               };
-              console.log(
-                `[Transcript] ${transcriptData.speaker}: ${trimmed.slice(0, 120)}`,
-              );
-              if ((window as any).screenAppSendTranscript) {
-                (window as any).screenAppSendTranscript(transcriptData);
-              }
+
+              // check if we're still on a valid Google Meet page
+              isOnValidGoogleMeetPageInterval = setInterval(() => {
+                if (!isOnValidGoogleMeetPage()) {
+                  console.log(
+                    'Google Meet page state changed - ending recording on team:',
+                    userId,
+                    teamId,
+                  );
+                  clearInterval(isOnValidGoogleMeetPageInterval);
+                  stopTheRecording();
+                }
+              }, 10000);
             };
 
-            const processCaption = () => {
-              try {
-                const result = extractCaption();
+            detectModalsAndDismiss();
 
-                // Case 1: Caption disappeared → commit pending
-                if (!result || !result.text) {
-                  if (pendingText) sendCommitted(pendingSpeaker, pendingText);
-                  pendingText = '';
-                  pendingSpeaker = '';
-                  return;
+            detectMeetingIsOnAValidPage();
+
+            // Transcript Scraping Logic
+            // Uses multiple strategies since Google Meet class names change frequently.
+            const startTranscriptScraping = () => {
+              console.log('Starting transcript scraping (multi-strategy)...');
+
+              /**
+               * Core function: try every known strategy to extract the current
+               * caption text + speaker name visible on screen.
+               */
+              const extractCaption = (): {
+                speaker: string;
+                text: string;
+              } | null => {
+                // ── Strategy 1: Google Meet captions container (confirmed from real DOM) ──
+                // The outer container is div[aria-label="Captions"] — this ARIA attribute
+                // is stable. Inside each caption entry (.nMcdL > .bj4p3b):
+                //   speaker:  span.NWpY1d  (or div.KcIKyf span)
+                //   text:     div.ygicle   (or div.VbkSUe as a fallback class)
+                const captionsRoot = document.querySelector(
+                  'div[aria-label="Captions"]',
+                );
+                if (captionsRoot) {
+                  // Each caption entry is a .nMcdL block inside the root
+                  const entries =
+                    captionsRoot.querySelectorAll('.nMcdL, .bj4p3b');
+                  // Iterate backwards to read the newest, actively growing caption block
+                  for (const entry of Array.from(entries).reverse()) {
+                    const textEl = entry.querySelector(
+                      'div.ygicle, div.VbkSUe, div.iTTPOb',
+                    ) as HTMLElement | null;
+                    const speakerEl = entry.querySelector(
+                      'span.NWpY1d, div.KcIKyf span, div.adE6rb span',
+                    ) as HTMLElement | null;
+                    const text = textEl?.innerText?.trim() ?? '';
+                    const speaker = speakerEl?.innerText?.trim() ?? '';
+                    if (text) {
+                      return { speaker, text };
+                    }
+                  }
                 }
 
-                const { text, speaker } = result;
-                const tLower = text.toLowerCase();
-
-                // Noise filter: skip Google Meet policy/abuse/removal notices
-                if (
-                  tLower.includes('abuse is reported on a call') ||
-                  tLower.includes('google for verification') ||
-                  tLower.includes("you've been removed") ||
-                  tLower.includes('you have been removed') ||
-                  tLower.includes('seconds left') ||
-                  tLower.includes('returning to home screen')
-                ) {
-                  return;
+                // ── Strategy 2: aria-live / role="status" regions ──
+                // NOTE: only fire when the caption container (S1) has text; aria-live
+                // regions in Google Meet also emit UI *notifications* ("has left the
+                // meeting", connectivity warnings, etc.) which must be filtered out.
+                const UI_NOTIFICATION_PATTERNS = [
+                  'has left the meeting',
+                  'has joined the meeting',
+                  'is in the waiting room',
+                  'no one else is in this meeting',
+                  'your internet connection',
+                  'internet connection is unstable',
+                  'is having connection issues',
+                  'is now presenting',
+                  'stopped presenting',
+                  'jump to bottom',
+                  'you are muted',
+                  'unmute yourself',
+                  'meeting code',
+                  'get help here',
+                  'go to the more options',
+                  'has been admitted',
+                  "you've been removed",
+                  'you have been removed',
+                  'seconds left',
+                  'returning to home screen',
+                ];
+                const ariaRegions = document.querySelectorAll(
+                  '[aria-live="polite"], [aria-live="assertive"], [role="status"]',
+                );
+                for (const region of Array.from(ariaRegions)) {
+                  const text = (region as HTMLElement).innerText?.trim() ?? '';
+                  if (!text || text.length >= 500 || text.length <= 2) continue;
+                  const tLower = text.toLowerCase();
+                  const isNotification = UI_NOTIFICATION_PATTERNS.some((p) =>
+                    tLower.includes(p),
+                  );
+                  if (!isNotification) {
+                    return { speaker: '', text };
+                  }
                 }
 
-                if (text === pendingText) return; // no change
+                // ── Strategy 3: position-based bottom 35% of viewport ──
+                const vh = window.innerHeight;
+                const captionZoneTop = vh * 0.65;
+                const allDivs = Array.from(
+                  document.querySelectorAll('div, span'),
+                );
 
-                // Continuation check (normalized — ignores punctuation/case):
-                //   - new text must be at least as long as the old text, AND
-                //   - its normalized form must begin with the old text's prefix
-                // If either fails → the block was reset → commit old utterance.
-                const normOld = clean(pendingText);
-                const normNew = clean(text);
-                const prefixLen = Math.min(normOld.length, 30);
-                const isContinuation =
-                  pendingText.length === 0 ||
-                  (normNew.length >= normOld.length &&
-                    normNew.startsWith(normOld.substring(0, prefixLen)));
-
-                if (!isContinuation) {
-                  // Block reset → commit the completed utterance
-                  if (pendingText) sendCommitted(pendingSpeaker, pendingText);
+                const candidateTexts: string[] = [];
+                for (const el of allDivs) {
+                  const rect = el.getBoundingClientRect();
+                  if (
+                    rect.top >= captionZoneTop &&
+                    rect.bottom <= vh + 10 &&
+                    rect.width > 100
+                  ) {
+                    const elHtml = el as HTMLElement;
+                    // Skip buttons and labelled controls (UI chrome)
+                    if (
+                      elHtml.tagName === 'BUTTON' ||
+                      elHtml.getAttribute('role') === 'button' ||
+                      elHtml.hasAttribute('aria-label')
+                    )
+                      continue;
+                    const ownText = Array.from(el.childNodes)
+                      .filter((n) => n.nodeType === Node.TEXT_NODE)
+                      .map((n) => n.textContent?.trim())
+                      .join(' ')
+                      .trim();
+                    // Require at least 20 chars — filters out meeting codes / nav labels
+                    if (
+                      ownText &&
+                      ownText.length >= 20 &&
+                      ownText.length < 300
+                    ) {
+                      candidateTexts.push(ownText);
+                    } else if (
+                      elHtml.innerText &&
+                      elHtml.children.length === 0 &&
+                      elHtml.innerText.length >= 20 &&
+                      elHtml.innerText.length < 300
+                    ) {
+                      candidateTexts.push(elHtml.innerText.trim());
+                    }
+                  }
                 }
+                if (candidateTexts.length > 0) {
+                  return { speaker: '', text: candidateTexts.join(' ') };
+                }
+                return null;
+              };
 
-                pendingText = text;
-                pendingSpeaker = speaker;
+              // ── Transcript buffering: commit-on-block-reset ──────────────────────
+              // Strategy: Google Meet keeps ONE growing caption block. Words are
+              // appended live (~300ms apart). The block RESETS (clears & starts
+              // fresh) when the speaker pauses or a sentence ends naturally.
+              // We buffer the growing text and only commit when:
+              //   1. The caption disappears (block cleared)
+              //   2. The new text is shorter / diverges from the old text (reset)
+              //   3. The utterance exceeds MAX_UTTERANCE_CHARS (very long speech)
+              //   4. __transcriptFlush() is called before recording stops
+              //
+              // NO debounce — a debounce fires mid-utterance and generates
+              // multiple duplicate entries for the same block.
+              let pendingText = '';
+              let pendingSpeaker = '';
+              const MAX_UTTERANCE_CHARS = 400;
 
-                // Safety flush for very long continuous speech
-                if (pendingText.length > MAX_UTTERANCE_CHARS) {
+              const clean = (t: string) =>
+                t.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+              const sendCommitted = (speaker: string, text: string) => {
+                const trimmed = text.trim();
+                if (!trimmed) return;
+                const transcriptData = {
+                  type: 'transcript',
+                  timestamp: new Date().toISOString(),
+                  speaker: speaker || 'Unknown Speaker',
+                  text: trimmed,
+                };
+                console.log(
+                  `[Transcript] ${transcriptData.speaker}: ${trimmed.slice(0, 120)}`,
+                );
+                if ((window as any).screenAppSendTranscript) {
+                  (window as any).screenAppSendTranscript(transcriptData);
+                }
+              };
+
+              const processCaption = () => {
+                try {
+                  const result = extractCaption();
+
+                  // Case 1: Caption disappeared → commit pending
+                  if (!result || !result.text) {
+                    if (pendingText) sendCommitted(pendingSpeaker, pendingText);
+                    pendingText = '';
+                    pendingSpeaker = '';
+                    return;
+                  }
+
+                  const { text, speaker } = result;
+                  const tLower = text.toLowerCase();
+
+                  // Noise filter: skip Google Meet policy/abuse/removal notices
+                  if (
+                    tLower.includes('abuse is reported on a call') ||
+                    tLower.includes('google for verification') ||
+                    tLower.includes("you've been removed") ||
+                    tLower.includes('you have been removed') ||
+                    tLower.includes('seconds left') ||
+                    tLower.includes('returning to home screen')
+                  ) {
+                    return;
+                  }
+
+                  if (text === pendingText) return; // no change
+
+                  // Continuation check (normalized — ignores punctuation/case):
+                  //   - new text must be at least as long as the old text, AND
+                  //   - its normalized form must begin with the old text's prefix
+                  // If either fails → the block was reset → commit old utterance.
+                  const normOld = clean(pendingText);
+                  const normNew = clean(text);
+                  const prefixLen = Math.min(normOld.length, 30);
+                  const isContinuation =
+                    pendingText.length === 0 ||
+                    (normNew.length >= normOld.length &&
+                      normNew.startsWith(normOld.substring(0, prefixLen)));
+
+                  if (!isContinuation) {
+                    // Block reset → commit the completed utterance
+                    if (pendingText) sendCommitted(pendingSpeaker, pendingText);
+                  }
+
+                  pendingText = text;
+                  pendingSpeaker = speaker;
+
+                  // Safety flush for very long continuous speech
+                  if (pendingText.length > MAX_UTTERANCE_CHARS) {
+                    sendCommitted(pendingSpeaker, pendingText);
+                    pendingText = '';
+                    pendingSpeaker = '';
+                  }
+                } catch (e) {
+                  // Swallow — don't let transcript errors kill the recording
+                }
+              };
+
+              // Flush the last in-flight utterance (called before recording stops)
+              (window as any).__transcriptFlush = () => {
+                if (pendingText) {
                   sendCommitted(pendingSpeaker, pendingText);
                   pendingText = '';
                   pendingSpeaker = '';
                 }
-              } catch (e) {
-                // Swallow — don't let transcript errors kill the recording
-              }
+              };
+
+              // MutationObserver — fires on DOM changes (immediate)
+              const observer = new MutationObserver(() => processCaption());
+              observer.observe(document.body, {
+                childList: true,
+                subtree: true,
+                characterData: true,
+              });
+
+              // setInterval fallback — polls every 2 s in case the observer misses rapid updates
+              const pollInterval = setInterval(processCaption, 2000);
+
+              console.log(
+                'Transcript observing started (MutationObserver + 2s poll)',
+              );
+
+              // Store cleanup ref on window so stopTheRecording can clear the interval
+              (window as any).__transcriptPollInterval = pollInterval;
             };
 
-            // Flush the last in-flight utterance (called before recording stops)
-            (window as any).__transcriptFlush = () => {
-              if (pendingText) {
-                sendCommitted(pendingSpeaker, pendingText);
-                pendingText = '';
-                pendingSpeaker = '';
-              }
-            };
+            // Call the function to start scraped logic
+            startTranscriptScraping();
 
-            // MutationObserver — fires on DOM changes (immediate)
-            const observer = new MutationObserver(() => processCaption());
-            observer.observe(document.body, {
-              childList: true,
-              subtree: true,
-              characterData: true,
-            });
+            // Cancel this timeout when stopping the recording
+            // Stop recording after `duration` minutes upper limit
+            timeoutId = setTimeout(async () => {
+              stopTheRecording();
+            }, duration);
+          }
 
-            // setInterval fallback — polls every 2 s in case the observer misses rapid updates
-            const pollInterval = setInterval(processCaption, 2000);
-
-            console.log(
-              'Transcript observing started (MutationObserver + 2s poll)',
-            );
-
-            // Store cleanup ref on window so stopTheRecording can clear the interval
-            (window as any).__transcriptPollInterval = pollInterval;
-          };
-
-          // Call the function to start scraped logic
-          startTranscriptScraping();
-
-          // Cancel this timeout when stopping the recording
-          // Stop recording after `duration` minutes upper limit
-          timeoutId = setTimeout(async () => {
-            stopTheRecording();
-          }, duration);
-        }
-
-        // Start the recording
-        await startRecording();
-      },
-      {
-        teamId,
-        duration,
-        inactivityLimit,
-        userId,
-        slightlySecretId: this.slightlySecretId,
-        activateInactivityDetectionAfterMinutes:
-          config.activateInactivityDetectionAfter,
-        primaryMimeType: webmMimeType,
-        secondaryMimeType: vp9MimeType,
-      },
-    );
+          // Start the recording
+          await startRecording();
+        },
+        {
+          teamId,
+          duration,
+          inactivityLimit,
+          userId,
+          slightlySecretId: this.slightlySecretId,
+          activateInactivityDetectionAfterMinutes:
+            config.activateInactivityDetectionAfter,
+          primaryMimeType: audioOnly ? audioWebmMimeType : webmMimeType,
+          secondaryMimeType: audioOnly ? audioWebmMimeType : vp9MimeType,
+          audioOnly,
+        },
+      );
+    } catch (evalError) {
+      // page.evaluate failed (e.g. NotSupportedError from getDisplayMedia).
+      // Resolve the waiting promise early so its .then() fires immediately rather
+      // than after the full recording-duration timeout, then close the browser so
+      // a subsequent retry is not killed by a dangling cleanup handler.
+      waitingPromise.resolveEarly();
+      if (screenshotInterval) clearInterval(screenshotInterval);
+      this._logger.error('Recording evaluate failed — closing browser', {
+        error:
+          evalError instanceof Error ? evalError.message : String(evalError),
+      });
+      await this.page.context().browser()?.close();
+      throw evalError;
+    }
 
     this._logger.info(
       'Waiting for recording duration',
       config.maxRecordingDuration,
       'minutes...',
     );
-    const processingTime = 0.2 * 60 * 1000;
-    const waitingPromise: WaitPromise = getWaitingPromise(
-      processingTime + duration,
-    );
+
+    // Capture the browser reference now so a future retry's this.page reassignment
+    // cannot cause this promise handler to close the wrong browser.
+    const browser = this.page.context().browser();
 
     waitingPromise.promise.then(async () => {
+      // Clear the screenshot interval if it was running
+      if (screenshotInterval) {
+        clearInterval(screenshotInterval);
+      }
+
       this._logger.info('Closing the browser...');
-      await this.page.context().browser()?.close();
+      await browser?.close();
 
       this._logger.info('All done ✨', { eventId, botId, userId, teamId });
     });
 
     await waitingPromise.promise;
+    return capturedImages;
   }
 
   private async ensureMuted(selector: string, location: string): Promise<void> {

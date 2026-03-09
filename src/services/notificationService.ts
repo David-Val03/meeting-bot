@@ -10,6 +10,7 @@ export interface RecordingCompletedPayload {
   meetingLink?: string;
   status: 'completed' | string;
   blobUrl?: string; // generic storage url (S3, Azure blob, etc.)
+  images?: string[];
   timestamp: string; // ISO string
   statusCode?: number;
   metadata?: Record<string, any>;

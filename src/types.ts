@@ -110,7 +110,8 @@ export type ContentType =
   | 'video/webm'
   | 'video/mp4'
   | 'video/x-matroska'
-  | 'application/json';
+  | 'application/json'
+  | 'image/png';
 
 export const extensionToContentType: Record<string, ContentType> = {
   '.webm': 'video/webm',

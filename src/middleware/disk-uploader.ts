@@ -70,6 +70,7 @@ export interface IUploader {
   }): Promise<boolean>;
   saveDataToTempFile(data: Buffer): Promise<boolean>;
   saveTranscript(data: TranscriptRawEntry): Promise<boolean>;
+  setImages?(images: string[]): void;
 }
 
 // Save to disk and upload in one session
@@ -108,6 +109,7 @@ class DiskUploader implements IUploader {
   private diskWriteSuccess: LogAggregator;
 
   private forceUpload: boolean;
+  private _images?: string[];
 
   private constructor(
     token: string,
@@ -139,6 +141,10 @@ class DiskUploader implements IUploader {
       `Success writing temp chunk to disk ${this._userId}`,
     );
     this.forceUpload = false;
+  }
+
+  public setImages(images: string[]): void {
+    this._images = images;
   }
 
   public static async initialize(
@@ -893,6 +899,7 @@ class DiskUploader implements IUploader {
               interviewId: this._eventId,
               contentType: this.contentType,
               uploaderType: config.uploaderType,
+              images: this._images,
             },
           };
 

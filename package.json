@@ -5,7 +5,7 @@
   "main": "index.js",
   "license": "MIT",
   "scripts": {
-    "start": "nodemon --legacy-watch src/index.ts",
+    "start": "nodemon",
     "dev": "docker compose up --build",
     "stop": "docker compose down",
     "build": "tsc",
@@ -41,6 +41,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.787.0",
     "@aws-sdk/lib-storage": "^3.876.0",
+    "@aws-sdk/s3-request-presigner": "^3.1004.0",
     "@azure/identity": "^4.13.0",
     "@azure/storage-blob": "^12.29.1",
     "@google-cloud/storage": "^7.16.0",

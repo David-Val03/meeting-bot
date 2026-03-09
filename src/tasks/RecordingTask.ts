@@ -2,7 +2,7 @@ import { Page } from 'playwright';
 import { Task } from '../lib/Task';
 import config from '../config';
 import { Logger } from 'winston';
-import { vp9MimeType, webmMimeType } from '../lib/recording';
+import { audioWebmMimeType, vp9MimeType, webmMimeType } from '../lib/recording';
 
 export class RecordingTask extends Task<null, void> {
   private userId: string;
@@ -11,14 +11,16 @@ export class RecordingTask extends Task<null, void> {
   private duration: number;
   private inactivityLimit: number;
   private slightlySecretId: string;
-  
+  private audioOnly?: boolean;
+
   constructor(
     userId: string,
     teamId: string,
     page: Page,
     duration: number,
     slightlySecretId: string,
-    logger: Logger
+    logger: Logger,
+    audioOnly?: boolean,
   ) {
     super(logger);
     this.userId = userId;
@@ -27,12 +29,34 @@ export class RecordingTask extends Task<null, void> {
     this.inactivityLimit = config.inactivityLimit * 60 * 1000;
     this.page = page;
     this.slightlySecretId = slightlySecretId;
+    this.audioOnly = audioOnly;
   }
 
   protected async execute(): Promise<void> {
     await this.page.evaluate(
-      async ({ teamId, duration, inactivityLimit, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, primaryMimeType, secondaryMimeType }:
-        { teamId: string, duration: number, inactivityLimit: number, userId: string, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, primaryMimeType: string, secondaryMimeType: string }) => {
+      async ({
+        teamId,
+        duration,
+        inactivityLimit,
+        userId,
+        slightlySecretId,
+        activateInactivityDetectionAfter,
+        activateInactivityDetectionAfterMinutes,
+        primaryMimeType,
+        secondaryMimeType,
+        audioOnly,
+      }: {
+        teamId: string;
+        duration: number;
+        inactivityLimit: number;
+        userId: string;
+        slightlySecretId: string;
+        activateInactivityDetectionAfter: string;
+        activateInactivityDetectionAfterMinutes: number;
+        primaryMimeType: string;
+        secondaryMimeType: string;
+        audioOnly?: boolean;
+      }) => {
         let timeoutId: NodeJS.Timeout;
         let inactivityDetectionTimeout: NodeJS.Timeout;
 
@@ -55,16 +79,26 @@ export class RecordingTask extends Task<null, void> {
         };
 
         async function startRecording() {
-          console.log('Will activate the inactivity detection after', activateInactivityDetectionAfter);
+          console.log(
+            'Will activate the inactivity detection after',
+            activateInactivityDetectionAfter,
+          );
 
           // Check for the availability of the mediaDevices API
-          if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
-            console.error('MediaDevices or getDisplayMedia not supported in this browser.');
+          if (
+            !navigator.mediaDevices ||
+            !navigator.mediaDevices.getDisplayMedia
+          ) {
+            console.error(
+              'MediaDevices or getDisplayMedia not supported in this browser.',
+            );
             return;
           }
 
-          const stream: MediaStream = await (navigator.mediaDevices as any).getDisplayMedia({
-            video: true,
+          const stream: MediaStream = await (
+            navigator.mediaDevices as any
+          ).getDisplayMedia({
+            video: audioOnly ? false : true,
             audio: {
               autoGainControl: false,
               channels: 2,
@@ -79,9 +113,10 @@ export class RecordingTask extends Task<null, void> {
           if (MediaRecorder.isTypeSupported(primaryMimeType)) {
             console.log(`Media Recorder will use ${primaryMimeType} codecs...`);
             options = { mimeType: primaryMimeType };
-          }
-          else {
-            console.warn(`Media Recorder did not find primary mime type codecs ${primaryMimeType}, Using fallback codecs ${secondaryMimeType}`);
+          } else {
+            console.warn(
+              `Media Recorder did not find primary mime type codecs ${primaryMimeType}, Using fallback codecs ${secondaryMimeType}`,
+            );
             options = { mimeType: secondaryMimeType };
           }
 
@@ -127,7 +162,8 @@ export class RecordingTask extends Task<null, void> {
           // TODO Create standard detection lib
           const detectLoneParticipant = () => {
             let dom: Document = document;
-            const iframe: HTMLIFrameElement | null = document.querySelector('iframe#webclient');
+            const iframe: HTMLIFrameElement | null =
+              document.querySelector('iframe#webclient');
             if (iframe && iframe.contentDocument) {
               console.log('Using iframe for participants detection...');
               dom = iframe.contentDocument;
@@ -136,16 +172,21 @@ export class RecordingTask extends Task<null, void> {
             loneTest = setInterval(() => {
               try {
                 // Detect and click blocking "OK" buttons
-                const okButton = Array.from(dom.querySelectorAll('button'))
-                    .filter((el) => el?.innerText?.trim()?.match(/^OK/i));
+                const okButton = Array.from(
+                  dom.querySelectorAll('button'),
+                ).filter((el) => el?.innerText?.trim()?.match(/^OK/i));
                 if (okButton && okButton[0]) {
-                  console.log('It appears that meeting has been ended. Click "OK" and verify if meeting is still in progress...', { userId });
+                  console.log(
+                    'It appears that meeting has been ended. Click "OK" and verify if meeting is still in progress...',
+                    { userId },
+                  );
                   let shouldEndMeeting = false;
-                  const meetingEndLabel = dom.querySelector('[aria-label="Meeting is end now"]');
+                  const meetingEndLabel = dom.querySelector(
+                    '[aria-label="Meeting is end now"]',
+                  );
                   if (meetingEndLabel) {
                     shouldEndMeeting = true;
-                  }
-                  else {
+                  } else {
                     const endText = 'This meeting has been ended by host';
                     const divs = dom.querySelectorAll('div');
                     for (const modal of divs) {
@@ -157,7 +198,10 @@ export class RecordingTask extends Task<null, void> {
                   }
                   okButton[0].click();
                   if (shouldEndMeeting) {
-                    console.log('Detected Zoom meeting has been ended by host. End Recording...', { userId });
+                    console.log(
+                      'Detected Zoom meeting has been ended by host. End Recording...',
+                      { userId },
+                    );
                     clearInterval(loneTest);
                     monitor = false;
                     stopTheRecording();
@@ -165,30 +209,47 @@ export class RecordingTask extends Task<null, void> {
                 }
 
                 // Detect number of participants
-                const participantsMatch = Array.from(dom.querySelectorAll('button'))
-                    .filter((el) => el?.innerText?.trim()?.match(/^\d+/));
-                const text = participantsMatch && participantsMatch.length > 0 ? participantsMatch[0].innerText.trim() : null;
+                const participantsMatch = Array.from(
+                  dom.querySelectorAll('button'),
+                ).filter((el) => el?.innerText?.trim()?.match(/^\d+/));
+                const text =
+                  participantsMatch && participantsMatch.length > 0
+                    ? participantsMatch[0].innerText.trim()
+                    : null;
                 if (!text) {
-                  console.error('Zoom presence detection is probably not working on user:', userId, teamId);
+                  console.error(
+                    'Zoom presence detection is probably not working on user:',
+                    userId,
+                    teamId,
+                  );
                   return;
                 }
 
                 const regex = new RegExp(/\d+/);
                 const participants = text.match(regex);
                 if (!participants || participants.length === 0) {
-                  console.error('Zoom participants detection is probably not working on user:', { userId, teamId });
+                  console.error(
+                    'Zoom participants detection is probably not working on user:',
+                    { userId, teamId },
+                  );
                   return;
                 }
                 if (Number(participants[0]) > 1) {
                   return;
                 }
 
-                console.log('Detected meeting bot is alone in meeting, ending recording on team:', { userId, teamId });
+                console.log(
+                  'Detected meeting bot is alone in meeting, ending recording on team:',
+                  { userId, teamId },
+                );
                 clearInterval(loneTest);
                 monitor = false;
                 stopTheRecording();
               } catch (error) {
-                console.error('Zoom Meeting presence detection failed on team:', { userId, teamId, message: error.message, error });
+                console.error(
+                  'Zoom Meeting presence detection failed on team:',
+                  { userId, teamId, message: error.message, error },
+                );
               }
             }, 2000); // Detect every 2 seconds
           };
@@ -217,12 +278,17 @@ export class RecordingTask extends Task<null, void> {
             const monitorSilence = () => {
               analyser.getByteFrequencyData(dataArray);
 
-              const audioActivity = dataArray.reduce((a, b) => a + b) / dataArray.length;
+              const audioActivity =
+                dataArray.reduce((a, b) => a + b) / dataArray.length;
 
               if (audioActivity < silenceThreshold) {
                 silenceDuration += 100; // Check every 100ms
                 if (silenceDuration >= inactivityLimit) {
-                  console.warn('Detected silence in Zoom Meeting and ending the recording on team:', userId, teamId);
+                  console.warn(
+                    'Detected silence in Zoom Meeting and ending the recording on team:',
+                    userId,
+                    teamId,
+                  );
                   monitor = false;
                   clearInterval(loneTest);
                   stopTheRecording();
@@ -244,10 +310,13 @@ export class RecordingTask extends Task<null, void> {
           /**
            * Perpetual checks for inactivity detection
            */
-          inactivityDetectionTimeout = setTimeout(() => {
-            detectLoneParticipant();
-            detectIncrediblySilentMeeting();
-          }, activateInactivityDetectionAfterMinutes * 60 * 1000);
+          inactivityDetectionTimeout = setTimeout(
+            () => {
+              detectLoneParticipant();
+              detectIncrediblySilentMeeting();
+            },
+            activateInactivityDetectionAfterMinutes * 60 * 1000,
+          );
 
           // Cancel this timeout when stopping the recording
           // Stop recording after `duration` minutes upper limit
@@ -259,17 +328,22 @@ export class RecordingTask extends Task<null, void> {
         // Start the recording
         await startRecording();
       },
-      { 
+      {
         teamId: this.teamId,
         duration: this.duration,
-        inactivityLimit: this.inactivityLimit, 
-        userId: this.userId, 
+        inactivityLimit: this.inactivityLimit,
+        userId: this.userId,
         slightlySecretId: this.slightlySecretId,
-        activateInactivityDetectionAfterMinutes: config.activateInactivityDetectionAfter,
-        activateInactivityDetectionAfter: new Date(new Date().getTime() + config.activateInactivityDetectionAfter * 60 * 1000).toISOString(),
-        primaryMimeType: webmMimeType,
-        secondaryMimeType: vp9MimeType
-      }
+        activateInactivityDetectionAfterMinutes:
+          config.activateInactivityDetectionAfter,
+        activateInactivityDetectionAfter: new Date(
+          new Date().getTime() +
+            config.activateInactivityDetectionAfter * 60 * 1000,
+        ).toISOString(),
+        primaryMimeType: this.audioOnly ? audioWebmMimeType : webmMimeType,
+        secondaryMimeType: this.audioOnly ? audioWebmMimeType : vp9MimeType,
+        audioOnly: this.audioOnly,
+      },
     );
   }
 }
