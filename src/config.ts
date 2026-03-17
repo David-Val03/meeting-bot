@@ -66,7 +66,7 @@ export default {
   serviceKey: process.env.SCREENAPP_BACKEND_SERVICE_API_KEY,
   joinWaitTime: process.env.JOIN_WAIT_TIME_MINUTES
     ? Number(process.env.JOIN_WAIT_TIME_MINUTES)
-    : 10,
+    : 20,
   // Number of retries for transient errors (not applied to WaitingAtLobbyRetryError)
   retryCount: process.env.RETRY_COUNT ? Number(process.env.RETRY_COUNT) : 2,
   miscStorageBucket: process.env.GCP_MISC_BUCKET,
@@ -97,10 +97,10 @@ export default {
   isRedisEnabled: process.env.REDIS_CONSUMER_ENABLED === 'true',
   s3CompatibleStorage: {
     endpoint: process.env.S3_ENDPOINT,
-    region: process.env.S3_REGION,
-    accessKeyId: process.env.S3_ACCESS_KEY_ID,
-    secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
-    bucket: process.env.S3_BUCKET_NAME,
+    region: process.env.S3_REGION ?? process.env.AWS_REGION,
+    accessKeyId: process.env.S3_ACCESS_KEY_ID ?? process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.S3_SECRET_ACCESS_KEY ?? process.env.AWS_SECRET_ACCESS_KEY,
+    bucket: process.env.S3_BUCKET_NAME ?? process.env.AWS_BUCKET_NAME,
     forcePathStyle: process.env.S3_USE_MINIO_COMPATIBILITY === 'true',
   },
   // Object storage provider selection: 's3' (default) or 'azure'

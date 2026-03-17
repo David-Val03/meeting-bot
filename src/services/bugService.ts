@@ -1,12 +1,34 @@
-import config, { NODE_ENV } from '../config';
+import { NODE_ENV } from '../config';
 import { Logger } from 'winston';
-import { getStorageProvider } from '../uploader/providers/factory';
+import { S3Client } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
 
 interface UploadOption {
   skipTimestamp?: boolean;
 }
 
-// TODO Save to local volume for development
+const awsUpload = async (file: Buffer, Key: string) => {
+  const s3 = new S3Client({
+    region: process.env.AWS_REGION ?? 'us-east-1',
+    credentials: {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+    },
+  });
+
+  const upload = new Upload({
+    client: s3,
+    params: {
+      Bucket: process.env.AWS_BUCKET_NAME!,
+      Key,
+      Body: file,
+      ContentType: 'image/png',
+    },
+  });
+
+  return upload.done();
+};
+
 export const uploadDebugImage = async (
   buffer: Buffer,
   fileName: string,
@@ -17,63 +39,24 @@ export const uploadDebugImage = async (
 ): Promise<string | undefined> => {
   try {
     if (NODE_ENV === 'development') {
-      // TODO add disk based file saving
-      return undefined;
-    }
-    logger.info('Begin upload Debug Image', userId);
-
-    const provider = getStorageProvider();
-
-    // Validate config before upload
-    try {
-      provider.validateConfig();
-    } catch (configError) {
-      logger.error('Storage provider configuration is invalid:', configError);
       return undefined;
     }
 
     const bot = botId ?? 'bot';
     const now = opts?.skipTimestamp ? '' : `-${new Date().toISOString()}`;
-    // Use the configured misc folder or default to meeting-bot
-    const folder = config.miscStorageFolder ?? 'meeting-bot';
-    const qualifiedFile = `${folder}/${userId}/${bot}/${fileName}${now}.png`;
+    const folder = process.env.GCP_MISC_BUCKET_FOLDER ?? 'meeting-bot';
+    const key = `${folder}/${userId}/${bot}/${fileName}${now}.png`;
 
-    const success = await provider.uploadBuffer(
-      buffer,
-      qualifiedFile,
-      'image/png',
-      logger,
-    );
+    const uploadedFile = await awsUpload(buffer, key);
+    console.log('uploadedFile', uploadedFile);
 
-    if (success) {
-      logger.info(
-        `Debug Image File uploaded successfully: ${fileName}`,
-        userId,
-      );
-
-      // Attempt to get a URL for the uploaded file
-      if (provider.getSignedUrl) {
-        try {
-          return await provider.getSignedUrl(qualifiedFile, {
-            expiresInSeconds: 3600 * 24 * 7,
-          });
-        } catch (e) {
-          logger.warn('Failed to get signed URL for debug image:', e);
-        }
-      }
-
-      // Fallback for GCS if bucket is set (to maintain old behavior for now)
-      if (config.miscStorageBucket && (provider as any).name === 'google') {
-        return `https://storage.googleapis.com/${config.miscStorageBucket}/${qualifiedFile}`;
-      }
-
-      return undefined;
-    } else {
-      logger.error(`Debug Image File upload failed: ${fileName}`, userId);
-      return undefined;
+    if (uploadedFile?.Location) {
+      return uploadedFile.Location;
     }
+
+    return undefined;
   } catch (err) {
-    logger.error('Error uploading debug image:', userId, err);
+    logger.error('Error uploading debug image', err);
     return undefined;
   }
 };

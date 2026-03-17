@@ -15,7 +15,8 @@ import { Logger } from 'winston';
 import { browserLogCaptureCallback } from '../util/logger';
 import { getWaitingPromise } from '../lib/promise';
 import { retryActionWithWait } from '../util/resilience';
-import { uploadDebugImage } from '../services/bugService';
+import { S3Client } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
 import createBrowserContext from '../lib/chromium';
 import {
   GOOGLE_LOBBY_MODE_HOST_TEXT,
@@ -23,7 +24,8 @@ import {
   GOOGLE_REQUEST_TIMEOUT,
 } from '../constants';
 import { audioWebmMimeType, vp9MimeType, webmMimeType } from '../lib/recording';
-
+import dotenv from 'dotenv';
+dotenv.config();
 export class GoogleMeetBot extends MeetBotBase {
   private _logger: Logger;
   private _correlationId: string;
@@ -75,8 +77,21 @@ export class GoogleMeetBot extends MeetBotBase {
         audioOnly,
       });
 
+      this._logger.info('joinMeeting returned images', {
+        count: images?.length ?? 0,
+        hasSetImages: !!uploader.setImages,
+        images,
+      });
       if (images && images.length > 0 && uploader.setImages) {
+        this._logger.info('Calling uploader.setImages', {
+          count: images.length,
+        });
         uploader.setImages(images);
+      } else {
+        this._logger.warn('setImages NOT called', {
+          imagesEmpty: !images || images.length === 0,
+          setImagesUndefined: !uploader.setImages,
+        });
       }
 
       // Finish the upload from the temp video
@@ -258,24 +273,34 @@ export class GoogleMeetBot extends MeetBotBase {
       async () =>
         await this.page.waitForSelector(
           'input[type="text"][aria-label="Your name"]',
-          { timeout: 10000 },
+          { timeout: 20000 },
         ),
       this._logger,
       3,
-      15000,
+      25000,
       async () => {
-        await uploadDebugImage(
-          await this.page.screenshot({ type: 'png', fullPage: true }),
-          'text-input-field-wait',
-          userId,
-          this._logger,
-          botId,
-        );
+        const buf = await this.page.screenshot({ type: 'png', fullPage: true });
+        const key = `meeting-bot/${userId}/${botId}/text-input-field-wait-${Date.now()}.png`;
+        await new Upload({
+          client: new S3Client({
+            region: process.env.AWS_REGION ?? 'us-east-1',
+            credentials: {
+              accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+              secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+            },
+          }),
+          params: {
+            Bucket: process.env.AWS_BUCKET_NAME!,
+            Key: key,
+            Body: buf,
+            ContentType: 'image/png',
+          },
+        }).done();
       },
     );
 
-    this._logger.info('Waiting for 10 seconds...');
-    await this.page.waitForTimeout(10000);
+    this._logger.info('Waiting for 20 seconds...');
+    await this.page.waitForTimeout(20000);
 
     // Try to mute before joining
     await this.ensureMuted(
@@ -289,8 +314,8 @@ export class GoogleMeetBot extends MeetBotBase {
       name ? name : 'ScreenApp Notetaker',
     );
 
-    this._logger.info('Waiting for 10 seconds...');
-    await this.page.waitForTimeout(10000);
+    this._logger.info('Waiting for 20 seconds...');
+    await this.page.waitForTimeout(20000);
 
     await retryActionWithWait(
       'Clicking the "Ask to join" button',
@@ -325,15 +350,25 @@ export class GoogleMeetBot extends MeetBotBase {
       },
       this._logger,
       3,
-      15000,
+      25000,
       async () => {
-        await uploadDebugImage(
-          await this.page.screenshot({ type: 'png', fullPage: true }),
-          'ask-to-join-button-click',
-          userId,
-          this._logger,
-          botId,
-        );
+        const buf = await this.page.screenshot({ type: 'png', fullPage: true });
+        const key = `meeting-bot/${userId}/${botId}/ask-to-join-button-click-${Date.now()}.png`;
+        await new Upload({
+          client: new S3Client({
+            region: process.env.AWS_REGION ?? 'us-east-1',
+            credentials: {
+              accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+              secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+            },
+          }),
+          params: {
+            Bucket: process.env.AWS_BUCKET_NAME!,
+            Key: key,
+            Body: buf,
+            ContentType: 'image/png',
+          },
+        }).done();
       },
     );
 
@@ -811,36 +846,82 @@ export class GoogleMeetBot extends MeetBotBase {
     let screenshotInterval: NodeJS.Timeout | null = null;
     const capturedImages: string[] = [];
 
+    this._logger.info('Screenshot capture check', { audioOnly, botId, userId });
+
     if (audioOnly) {
-      this._logger.info('Audio-only mode: Starting periodic screenshots');
+      this._logger.info('Audio-only mode: Starting periodic screenshots', {
+        intervalMs: 60000,
+      });
       const intervalMs = 60000; // 60 seconds
 
       screenshotInterval = setInterval(async () => {
         try {
-          if (!this.page || this.page.isClosed()) return;
-          this._logger.debug('Capturing screenshot...');
-          const buffer = await this.page.screenshot({
-            type: 'jpeg',
+          this._logger.info('Screenshot interval fired', {
+            pageExists: !!this.page,
+            pageClosed: this.page?.isClosed(),
+          });
+          if (!this.page || this.page.isClosed()) {
+            this._logger.warn('Screenshot skipped: page is missing or closed');
+            return;
+          }
+          this._logger.info('Capturing screenshot...');
+          const cdpSession = await this.page.context().newCDPSession(this.page);
+          const { data } = await cdpSession.send('Page.captureScreenshot', {
+            format: 'jpeg',
             quality: 80,
+          });
+          await cdpSession.detach();
+          const buffer = Buffer.from(data, 'base64');
+          this._logger.info('Screenshot captured', {
+            bufferSize: buffer.length,
           });
           const filename = `screenshot-${botId || Date.now()}-${Date.now()}`;
 
-          const url = await uploadDebugImage(
-            buffer,
-            filename,
-            userId || 'unknown-user',
-            this._logger,
-            botId,
-            { skipTimestamp: false },
-          );
+          const key = `meeting-bot/${userId}/${botId}/${filename}.png`;
+          this._logger.info('Uploading screenshot to S3', {
+            bucket: process.env.AWS_BUCKET_NAME,
+            region: process.env.AWS_REGION,
+            hasAccessKey: !!process.env.AWS_ACCESS_KEY_ID,
+            hasSecretKey: !!process.env.AWS_SECRET_ACCESS_KEY,
+            key,
+          });
+          const s3 = new S3Client({
+            region: process.env.AWS_REGION ?? 'us-east-1',
+            credentials: {
+              accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+              secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+            },
+          });
+          const uploadedFile = await new Upload({
+            client: s3,
+            params: {
+              Bucket: process.env.AWS_BUCKET_NAME!,
+              Key: key,
+              Body: buffer,
+              ContentType: 'image/png',
+            },
+          }).done();
+          this._logger.info('S3 upload response', { uploadedFile });
+          const url = uploadedFile?.Location;
 
           if (url) {
             capturedImages.push(url);
+            this._logger.info('Screenshot URL pushed to capturedImages', {
+              total: capturedImages.length,
+              url,
+            });
+          } else {
+            this._logger.warn(
+              'Screenshot uploaded but no URL returned — will not appear in images array',
+              { uploadedFile },
+            );
           }
         } catch (err) {
           this._logger.error('Failed to capture/upload screenshot:', err);
         }
       }, intervalMs);
+    } else {
+      this._logger.info('audioOnly is false — periodic screenshots disabled');
     }
 
     // Capture and send the browser console logs to Node.js context
@@ -1877,6 +1958,10 @@ export class GoogleMeetBot extends MeetBotBase {
     });
 
     await waitingPromise.promise;
+    this._logger.info('recordMeetingPage done — returning capturedImages', {
+      count: capturedImages.length,
+      capturedImages,
+    });
     return capturedImages;
   }
 
